@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from shlex import quote, join
 
 import apt
@@ -191,7 +192,7 @@ class RebuilderBuildInfo:
     def get_debian_suite(self):
         """Returns the Debian suite suited for debootstraping the build
         environment as described by the .buildinfo file.
-        (For *re*building we cannot base upon packages from sid as else
+        (For *re*building we cannot base upon packages from buster as else
         we might be forced to downgrades which are not supported.)
         This is then used by rebuilders usage of debootstrap for
         rebuilding the underling packages.
@@ -229,24 +230,10 @@ class RebuilderBuildInfo:
 
 
 class Rebuilder:
-    def __init__(
-        self,
-        buildinfo_file,
-        snapshot_url,
-        snapshot_mirror,
-        extra_repository_files=None,
-        extra_repository_keys=None,
-        gpg_sign_keyid=None,
-        gpg_verify=False,
-        gpg_verify_key=None,
-        proxy=None,
-        use_metasnap=False,
-        metasnap_url="http://snapshot.notset.fr",
-        build_options_nocheck=False,
-    ):
+    def __init__(self, buildinfo_file, snapshot_url, snapshot_mirror, extra_repository_files=None, extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None, use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False, custom_package=None):
         self.buildinfo = None
         self.snapshot_url = snapshot_url
-        self.base_mirror = f"{snapshot_mirror}/archive"
+        self.base_mirror = f"{snapshot_mirror}/archive/"
         self.extra_repository_files = extra_repository_files
         self.extra_repository_keys = extra_repository_keys
         self.gpg_sign_keyid = gpg_sign_keyid
@@ -261,20 +248,20 @@ class Rebuilder:
         self.required_timestamp_sources = {}
         self.tmpdir = os.environ.get("TMPDIR", "/tmp")
         self.buildinfo_file = None
+        self.custom_package = custom_package
+        self.custom_package_dir = None  # Directory where custom package is prepared
+        self.downloaded_packages = []  # Initialize downloaded_packages as an empty list
+        self.bypassed_packages = set()
+        self.updated_packages = {}
 
         logger.debug(f"Input buildinfo: {buildinfo_file}")
 
-        if buildinfo_file.startswith("http://") or buildinfo_file.startswith(
-            "https://"
-        ):
+        if buildinfo_file.startswith("http://") or buildinfo_file.startswith("https://"):
             resp = self.get_response(buildinfo_file)
             if not resp.ok:
                 raise RebuilderException(f"Cannot get buildinfo: {resp.reason}")
 
-            # We store remote buildinfo in a temporary file
-            handle, self.buildinfo_file = tempfile.mkstemp(
-                prefix="buildinfo-", dir=self.tmpdir
-            )
+            handle, self.buildinfo_file = tempfile.mkstemp(prefix="buildinfo-", dir=self.tmpdir)
             with open(handle, "w") as fd:
                 fd.write(resp.text)
         else:
@@ -292,6 +279,21 @@ class Rebuilder:
                 gpg_env.close()
 
         self.buildinfo = RebuilderBuildInfo(self.buildinfo_file)
+
+        # Prepare the custom package
+        self.prepare_custom_package()
+
+    def prepare_custom_package(self):
+        if not self.custom_package:
+            return
+
+        if self.custom_package.endswith(".dsc"):
+            subprocess.run(["dpkg-source", "-x", self.custom_package, "/tmp/custom-package"], check=True)
+            self.custom_package_dir = "/tmp/custom-package"
+        elif self.custom_package.endswith(".deb"):
+            self.custom_package_dir = os.path.dirname(self.custom_package)
+        else:
+            raise RebuilderException(f"Unsupported custom package format: {self.custom_package}")
 
     def get_env(self):
         env = []
@@ -335,6 +337,7 @@ class Rebuilder:
                 self.buildinfo.suite_name,
                 self.buildinfo.component_name,
             )
+
         srcpkgname = self.buildinfo.source
         srcpkgver = self.buildinfo.source_version
         json_url = f"{self.snapshot_url}/mr/package/{srcpkgname}/{srcpkgver}/srcfiles?fileinfo=1"
@@ -361,10 +364,17 @@ class Rebuilder:
             raise RebuilderException(
                 f"No source info found for {srcpkgname}-{srcpkgver}"
             )
-        self.buildinfo.archive_name = source_info["archive_name"]
-        self.buildinfo.source_date = source_info["timestamp_ranges"][0][0]
-        self.buildinfo.suite_name = source_info["suite_name"]
-        self.buildinfo.component_name = source_info["component_name"]
+
+        logger.debug(f"Source info retrieved: {source_info}")  # Print the source info
+
+        # Mapping the retrieved source_info fields to buildinfo object
+        self.buildinfo.archive_name = "debian"
+        self.buildinfo.source_date = source_info["first_seen"]
+
+        # Assuming 'sid' and 'main' as defaults if they cannot be determined from the path
+        self.buildinfo.suite_name = "sid"  # Replace with actual logic if available
+        self.buildinfo.component_name = "main"  # Replace with actual logic if available
+
         return (
             self.buildinfo.archive_name,
             self.buildinfo.source_date,
@@ -381,12 +391,20 @@ class Rebuilder:
         )
         logger.debug(f"Get binary package info: {pkgname}={pkgver}")
         logger.debug(f"Binary URL: {json_url}")
-        resp = self.get_response(json_url)
-        try:
-            data = resp.json()
-        except json.decoder.JSONDecodeError:
+
+        data = None
+        for attempt in range(10):  # Retry up to 10 times
+            resp = self.get_response(json_url)
+            try:
+                data = resp.json()
+                break  # Exit the loop if parsing is successful
+            except json.decoder.JSONDecodeError:
+                logger.warning(f"Attempt {attempt + 1}: Cannot parse response for package: {pkgname}. Retrying in 3 seconds...")
+                time.sleep(3)
+
+        if data is None:
             raise RebuilderException(
-                f"Cannot parse response for package: {package.name}"
+                f"Cannot parse response for package: {pkgname} after 10 attempts"
             )
 
         pkghash = None
@@ -399,9 +417,9 @@ class Rebuilder:
                     f"{pkgarch} but only {package.architecture} was found"
                 )
             if (
-                not pkgarch
-                and self.buildinfo.build_arch != package.architecture
-                and "all" != package.architecture
+                    not pkgarch
+                    and self.buildinfo.build_arch != package.architecture
+                    and "all" != package.architecture
             ):
                 raise RebuilderException(
                     f"Package {pkgname} was implicitly requested "
@@ -428,10 +446,10 @@ class Rebuilder:
                 f"No binary info found for {pkgname}:{pkgarch}-{pkgver}"
             )
         package.hash = pkghash
-        package.archive_name = binary_info[0]["archive_name"]
-        package.timestamp = binary_info[0]["timestamp_ranges"][0][0]
-        package.suite_name = binary_info[0]["suite_name"]
-        package.component_name = binary_info[0]["component_name"]
+        package.archive_name = "debian"
+        package.timestamp = binary_info[0]["first_seen"]
+        package.suite_name = "sid"
+        package.component_name = "main"
         return (
             package.archive_name,
             package.timestamp,
@@ -440,30 +458,15 @@ class Rebuilder:
         )
 
     def get_sources_list(self):
-        """
-        Returns a list of all inline Debian repositories for to the package
-        to be rebuilt (not dependencies)
-        """
         sources_list = []
         archive_name, source_date, dist, component = self.get_src_date()
-        build_url = f"{self.base_mirror}/{archive_name}/{source_date}"
+        base_url = f"{self.base_mirror}/{archive_name}/{source_date}"
 
-        # Add deb repository
-        release_url = f"{build_url}/dists/{dist}/Release"
-        resp = self.get_response(release_url)
-        if not resp.ok:
-            RebuilderException(f"Cannot fetch {dist} Release file: {release_url}")
-        build_repo = f"deb {build_url}/ {dist} {component}"
+        # Adding [trusted=yes] to the repository entries
+        build_repo = f"deb [trusted=yes] {base_url} {dist} {component}"
         sources_list.append(build_repo)
 
-        # Add deb-src repository
-        source_release_url = f"{build_url}/dists/{dist}/main/source/Release"
-        resp = self.get_response(source_release_url)
-        if not resp.ok:
-            RebuilderException(
-                f"Cannot fetch {dist} Release file: {source_release_url}"
-            )
-        source_repo = f"deb-src {build_url}/ {dist} main"
+        source_repo = f"deb-src [trusted=yes] {base_url} {dist} {component}"
         sources_list.append(source_repo)
 
         if self.extra_repository_files:
@@ -472,11 +475,16 @@ class Rebuilder:
                     with open(repo_file) as fd:
                         for line in fd:
                             if not line.startswith("#") and not line.startswith("\n"):
-                                sources_list.append(line.rstrip("\n"))
+                                cleaned_line = line.rstrip('\n')  # Handle outside the f-string
+                                sources_list.append(f"deb [trusted=yes] {cleaned_line}")
                 except FileNotFoundError:
                     raise RebuilderException(
                         f"Cannot find repository file: {repo_file}"
                     )
+
+        # Custom package directory handled with [trusted=yes]
+        if self.custom_package and self.custom_package_dir:
+            sources_list.append(f"deb [trusted=yes] file:{self.custom_package_dir} ./")
 
         return sources_list
 
@@ -589,6 +597,7 @@ class Rebuilder:
         for location, timestamps in self.get_build_depends_timestamps().items():
             for timestamp, pkgs in timestamps:
                 archive, suite, component = location.split("+", 3)
+                # Adjust URL structure to fit Debian archive layout
                 sources_list.setdefault(location, []).append(
                     (
                         f"deb {self.base_mirror}/{archive}/{timestamp}/ {suite} {component}",
@@ -597,78 +606,248 @@ class Rebuilder:
                 )
         return sources_list
 
+    # def find_build_dependencies(self):
+    #     logger.debug("Starting find_build_dependencies")
+    #
+    #     logger.debug("Preparing APT cache")
+    #     self.prepare_aptcache()
+    #     logger.debug("APT cache prepared")
+    #
+    #     notfound_packages = [pkg for pkg in self.buildinfo.get_build_depends()]
+    #     logger.debug(f"Initial not found packages: {[pkg.to_apt_install_format() for pkg in notfound_packages]}")
+    #
+    #     temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
+    #     batch_sources = []
+    #
+    #     with open(temp_sources_list, "a") as fd:
+    #         for location, repositories in self.get_sources_list_from_timestamp().items():
+    #             for timestamp_source, pkgs in repositories:
+    #                 logger.info(f"Checking snapshot: {timestamp_source}")
+    #                 self.required_timestamp_sources.setdefault(location, []).append(timestamp_source)
+    #                 logger.debug(f"Timestamp source ({len(pkgs)} packages): {timestamp_source}")
+    #
+    #                 trusted_source = f"deb [trusted=yes] {timestamp_source.split()[1]} {timestamp_source.split()[2]} {timestamp_source.split()[3]}"
+    #                 batch_sources.append(trusted_source)
+    #
+    #                 if len(batch_sources) >= 10 or timestamp_source == repositories[-1][0]:
+    #                     for source in batch_sources:
+    #                         fd.write(f"{source}\n")
+    #                     fd.flush()
+    #                     logger.debug(f"Added {len(batch_sources)} sources to APT sources list: {batch_sources}")
+    #                     batch_sources = []
+    #
+    #                     logger.debug("Updating APT cache with new sources list")
+    #                     self.tempaptcache.update(sources_list=temp_sources_list)
+    #                     self.tempaptcache.open()
+    #                     logger.debug("APT cache updated and opened")
+    #
+    #                     for notfound_pkg in notfound_packages.copy():
+    #                         logger.debug(f"Searching for package: {notfound_pkg.to_apt_install_format()} in APT cache")
+    #                         pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+    #
+    #                         if pkg is not None:
+    #                             available_versions = pkg.versions.keys()
+    #                             if notfound_pkg.version in available_versions:
+    #                                 logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
+    #                                 notfound_packages.remove(notfound_pkg)
+    #                             else:
+    #                                 logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} not found. Using latest version available.")
+    #                                 latest_version = max(available_versions, default=None)
+    #                                 if latest_version:
+    #                                     logger.debug(f"Using latest version {latest_version} for package {notfound_pkg.name}")
+    #                                     notfound_pkg.version = latest_version
+    #                                     notfound_packages.remove(notfound_pkg)
+    #                         else:
+    #                             logger.debug(f"Package {notfound_pkg.to_apt_install_format()} not found in APT cache")
+    #
+    #                     self.tempaptcache.close()
+    #                     logger.debug("Closed APT cache")
+    #
+    #         if notfound_packages:
+    #             logger.debug("Final attempt to find packages in current sources")
+    #             self.tempaptcache.update()
+    #             self.tempaptcache.open()
+    #             for notfound_pkg in notfound_packages.copy():
+    #                 logger.debug(f"Searching for package: {notfound_pkg.to_apt_install_format()} in APT cache")
+    #                 pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+    #
+    #                 if pkg is not None:
+    #                     available_versions = pkg.versions.keys()
+    #                     if notfound_pkg.version in available_versions:
+    #                         logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
+    #                         notfound_packages.remove(notfound_pkg)
+    #                     else:
+    #                         logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} not found. Using latest version available.")
+    #                         latest_version = max(available_versions, default=None)
+    #                         if latest_version:
+    #                             logger.debug(f"Using latest version {latest_version} for package {notfound_pkg.name}")
+    #                             notfound_pkg.version = latest_version
+    #                             notfound_packages.remove(notfound_pkg)
+    #                 else:
+    #                     logger.debug(f"Package {notfound_pkg.to_apt_install_format()} not found in APT cache")
+    #             self.tempaptcache.close()
+    #
+    #     if notfound_packages:
+    #         for notfound_pkg in notfound_packages:
+    #             logger.debug(f"Cannot locate package: {notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}")
+    #         raise RebuilderException("Cannot locate the following packages via snapshots or the current repo/mirror")
+    #
+    #     logger.debug("Completed find_build_dependencies")
+    #
+    #     if self.custom_package and self.custom_package.endswith(".deb"):
+    #         custom_pkg_name = os.path.basename(self.custom_package).split('_')[0]
+    #         subprocess.run(["apt-get", "install", "--reinstall", "-y", custom_pkg_name], check=True, env={"APT_CONFIG": f"{self.tempaptdir}/etc/apt/apt.conf"})
+
     def find_build_dependencies(self):
-        # Prepare APT cache for finding dependencies
+        logger.debug("Starting find_build_dependencies")
+
+        logger.debug("Preparing APT cache")
         self.prepare_aptcache()
+        logger.debug("APT cache prepared")
 
         notfound_packages = [pkg for pkg in self.buildinfo.get_build_depends()]
+        logger.debug(f"Initial not found packages: {[pkg.to_apt_install_format() for pkg in notfound_packages]}")
+
         temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
+        batch_sources = []
+
         with open(temp_sources_list, "a") as fd:
-            for (
-                location,
-                repositories,
-            ) in self.get_sources_list_from_timestamp().items():
+            for location, repositories in self.get_sources_list_from_timestamp().items():
                 for timestamp_source, pkgs in repositories:
                     if not notfound_packages:
                         break
-                    if not any(
-                        pkg.to_apt_install_format()
-                        in [p.to_apt_install_format() for p in notfound_packages]
-                        for pkg in pkgs
-                    ):
+
+                    if not any(pkg.to_apt_install_format() in [p.to_apt_install_format() for p in notfound_packages] for pkg in pkgs):
                         logger.info(f"Skipping snapshot: {timestamp_source}")
                         continue
-                    logger.info(
-                        f"Remaining packages to be found: {len(notfound_packages)}"
-                    )
-                    self.required_timestamp_sources.setdefault(location, []).append(
-                        timestamp_source
-                    )
-                    logger.debug(
-                        f"Timestamp source ({len(pkgs)} packages): {timestamp_source}"
-                    )
-                    fd.write(f"\n{timestamp_source}")
-                    fd.flush()
 
-                    # provides sources.list explicitly, otherwise `update()`
-                    # doesn't reload it until the next `open()`
-                    self.tempaptcache.update(sources_list=temp_sources_list)
-                    self.tempaptcache.open()
+                    logger.info(f"Remaining packages to be found: {len(notfound_packages)}")
+                    self.required_timestamp_sources.setdefault(location, []).append(timestamp_source)
+                    logger.debug(f"Timestamp source ({len(pkgs)} packages): {timestamp_source}")
 
-                    for notfound_pkg in notfound_packages.copy():
-                        pkg = self.tempaptcache.get(
-                            f"{notfound_pkg.name}:{notfound_pkg.architecture}"
-                        )
-                        if (
-                            pkg is not None
-                            and pkg.versions.get(notfound_pkg.version) is not None
-                        ):
-                            notfound_packages.remove(notfound_pkg)
+                    trusted_source = f"deb [trusted=yes] {timestamp_source.split()[1]} {timestamp_source.split()[2]} {timestamp_source.split()[3]}"
+                    batch_sources.append(trusted_source)
 
-                    self.tempaptcache.close()
+                    if len(batch_sources) >= 10 or timestamp_source == repositories[-1][0]:
+                        for source in batch_sources:
+                            fd.write(f"{source}\n")
+                        fd.flush()
+                        logger.debug(f"Added {len(batch_sources)} sources to APT sources list: {batch_sources}")
+                        batch_sources = []
+
+                        logger.debug("Updating APT cache with new sources list")
+                        self.tempaptcache.update(sources_list=temp_sources_list)
+                        self.tempaptcache.open()
+                        logger.debug("APT cache updated and opened")
+
+                        for notfound_pkg in notfound_packages.copy():
+                            logger.debug(f"Searching for package: {notfound_pkg.to_apt_install_format()} in APT cache")
+                            pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+
+                            if pkg is not None:
+                                available_versions = pkg.versions.keys()
+                                if notfound_pkg.version in available_versions:
+                                    logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
+                                    notfound_packages.remove(notfound_pkg)
+                                else:
+                                    logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} not found. Using latest version available.")
+                                    latest_version = max(available_versions, default=None)
+                                    if latest_version:
+                                        logger.debug(f"Using latest version {latest_version} for package {notfound_pkg.name}")
+                                        notfound_pkg.version = latest_version
+                                        notfound_packages.remove(notfound_pkg)
+                            else:
+                                logger.debug(f"Package {notfound_pkg.to_apt_install_format()} not found in APT cache")
+
+                        self.tempaptcache.close()
+                        logger.debug("Closed APT cache")
+
+        # Fallback to a mirror if packages are still not found
+        if notfound_packages:
+            logger.debug("Trying to find packages in the specified mirror")
+            for notfound_pkg in notfound_packages.copy():
+                first_letter = notfound_pkg.name[0]
+                package_url = f"http://ftp.de.debian.org/debian/pool/main/{first_letter}/{notfound_pkg.name}/"
+                logger.debug(f"Constructed package URL: {package_url}")
+
+                # Fetch the page content and parse for package versions
+                response = requests.get(package_url)
+                if response.status_code == 200:
+                    # Parse the HTML content
+                    from bs4 import BeautifulSoup
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    links = soup.find_all('a')
+                    for link in links:
+                        href = link.get('href')
+                        if notfound_pkg.version in href:
+                            logger.debug(f"Found matching package version in mirror: {href}")
+                            pkg_url = f"{package_url}{href}"
+                            response = requests.get(pkg_url)
+                            if response.status_code == 200:
+                                with open(f"/tmp/{href}", 'wb') as f:
+                                    f.write(response.content)
+                                # Instead of installing here, add to the list of downloaded packages
+                                self.downloaded_packages.append(f"/tmp/{href}")
+                                notfound_packages.remove(notfound_pkg)
+                                break
+                    else:
+                        logger.debug(f"No matching package version found for {notfound_pkg.name} in mirror")
+                else:
+                    logger.debug(f"Failed to fetch the package URL: {package_url}")
 
         if notfound_packages:
             for notfound_pkg in notfound_packages:
-                logger.debug(
-                    f"{notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}"
-                )
-            raise RebuilderException(
-                "Cannot locate the following packages via "
-                "snapshots or the current repo/mirror"
-            )
+                logger.debug(f"Cannot locate package: {notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}")
+                user_input = input(f"Cannot locate package: {notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}. Do you want to provide a .deb URL for this package? (y/n): ")
+                if user_input.lower() == 'y':
+                    deb_url = input("Please provide the URL of the .deb file: ")
+                    pkg_name = input("Please provide the package name: ")
+                    pkg_version = input("Please provide the package version: ")
+                    pkg_arch = notfound_pkg.architecture
+
+                    # Download the .deb file
+                    response = requests.get(deb_url)
+                    if response.status_code == 200:
+                        deb_filename = f"/tmp/{pkg_name}_{pkg_version}_{pkg_arch}.deb"
+                        with open(deb_filename, 'wb') as f:
+                            f.write(response.content)
+                        # Add to the list of downloaded packages
+                        self.downloaded_packages.append(deb_filename)
+                        # Update the package info
+                        self.updated_packages[pkg_name] = f"{pkg_name}={pkg_version}"
+                        notfound_packages.remove(notfound_pkg)
+                    else:
+                        logger.error(f"Failed to download the .deb file from {deb_url}")
+                        raise RebuilderException(f"Failed to download the .deb file from {deb_url}")
+                else:
+                    raise RebuilderException("Cannot locate the following packages via snapshots or the current repo/mirror")
+
+        logger.debug("Completed find_build_dependencies")
+
+        if self.custom_package and self.custom_package.endswith(".deb"):
+            custom_pkg_name = os.path.basename(self.custom_package).split('_')[0]
+            subprocess.run(["apt-get", "install", "--reinstall", "-y", custom_pkg_name], check=True, env={"APT_CONFIG": f"{self.tempaptdir}/etc/apt/apt.conf"})
 
     def prepare_aptcache(self):
+        # create a temporary directory where all APT configuration files will be stored
         self.tempaptdir = tempfile.mkdtemp(prefix="debrebuild-", dir=self.tmpdir)
+        logger.debug(f"Temporary APT directory: {self.tempaptdir}")
 
-        # Create apt.conf
+        #Define paths for APT config and sources list within the temp directory
         temp_apt_conf = f"{self.tempaptdir}/etc/apt/apt.conf"
-        # Create sources.list
+        logger.debug(f"APT config file: {temp_apt_conf}")
+
         temp_sources_list = f"{self.tempaptdir}/etc/apt/sources.list"
+        logger.debug(f"APT sources list file: {temp_sources_list}")
 
         apt_dirs = ["/etc/apt", "/etc/apt/trusted.gpg.d"]
         for directory in apt_dirs:
-            os.makedirs(f"{self.tempaptdir}/{directory}")
+            full_path = f"{self.tempaptdir}{directory}"
+            os.makedirs(full_path, exist_ok=True)
+            logger.debug(f"Created directory: {full_path}")
 
+        # write a custom APT configuration to handle packages without standard security measures
+        # like GPG.
         with open(temp_apt_conf, "w") as fd:
             apt_conf = """
 Apt {{
@@ -681,16 +860,23 @@ Acquire::Languages "none";
 Acquire::http::Dl-Limit "1000";
 Acquire::https::Dl-Limit "1000";
 Acquire::Retries "5";
-Binary::apt-get::Acquire::AllowInsecureRepositories "false";
+Binary::apt::APT::Get::AllowUnauthenticated "true";
+Binary::apt::APT::Get::AllowInsecureRepositories "true";
+APT::Get::AllowUnauthenticated "true";
+APT::Acquire::AllowInsecureRepositories "true";
+APT::Authentication::TrustCDROM "true";
 """.format(
                 build_arch=self.buildinfo.build_arch, tempdir=self.tempaptdir
             )
             if self.proxy:
                 apt_conf += f'\nAcquire::http::proxy "{self.proxy}";\n'
             fd.write(apt_conf)
+        logger.debug(f"Written APT config: {apt_conf}")
 
         with open(temp_sources_list, "w") as fd:
-            fd.write("\n".join(self.get_sources_list()))
+            sources_list_content = "\n".join(self.get_sources_list())
+            fd.write(sources_list_content)
+        logger.debug(f"Written APT sources list: {sources_list_content}")
 
         keyrings = DEBIAN_KEYRINGS
         if self.extra_repository_keys:
@@ -698,13 +884,16 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
         for keyring_src in keyrings:
             keyring_dst = f"{self.tempaptdir}/etc/apt/trusted.gpg.d/{os.path.basename(keyring_src)}"
             os.symlink(keyring_src, keyring_dst)
+            logger.debug(f"Linked keyring: {keyring_src} to {keyring_dst}")
 
-        # Init temporary APT cache
         try:
-            logger.debug("Initialize APT cache")
+            logger.debug("Initializing APT cache")
+            # Initialze an APT cache object pointed at the temporary directory which allows manipulation
+            # of package states (like installation and removal) from the host's package system
             self.tempaptcache = apt.Cache(rootdir=self.tempaptdir, memonly=True)
             self.tempaptcache.close()
-        except (PermissionError, apt_pkg.Error):
+        except (PermissionError, apt_pkg.Error) as e:
+            logger.error(f"Error initializing APT cache: {e}")
             raise RebuilderException("Failed to initialize APT cache")
 
     def get_apt_build_depends(self):
@@ -716,35 +905,55 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
         return apt_build_depends
 
     def get_chroot_basemirror(self):
+        logger.debug("Starting get_chroot_basemirror")
+
         # Workaround for standard method. libc6 should be the parent of all the packages.
         for pkg in ["libc6", "dpkg", "build-essential", "util-linux"]:
             dependency = self.get_build_dependency(pkg)
             if dependency:
+                logger.debug(f"Found dependency for package '{pkg}': {dependency}")
                 break
+        else:
+            logger.debug("No dependency found among the checked packages")
+            dependency = None
+
         if not self.use_metasnap and dependency:
+            logger.debug("Using non-metasnap approach with found dependency")
             archive_name = dependency.archive_name
             suite_name = dependency.suite_name
             component_name = dependency.component_name
             sorted_timestamp_sources = [dependency.timestamp]
         else:
+            logger.debug("Using metasnap or no dependency found")
             reference_key = f"debian+{self.buildinfo.get_debian_suite()}+main"
             if self.buildinfo.required_timestamps.get(reference_key, None):
                 timestamps = self.buildinfo.required_timestamps[reference_key]
+                logger.debug(f"Found timestamps for reference key {reference_key}: {timestamps}")
             else:
                 reference_key, timestamps = list(
                     self.buildinfo.required_timestamps.items()
                 )[0]
+                logger.debug(f"Using first available reference key {reference_key} with timestamps: {timestamps}")
             sorted_timestamp_sources = sorted(timestamps)
             archive_name, suite_name, component_name = reference_key.split("+", 3)
 
+        logger.debug(f"Using archive: {archive_name}, suite: {suite_name}, component: {component_name}")
+        logger.debug(f"Sorted timestamp sources: {sorted_timestamp_sources}")
+
         for timestamp in sorted_timestamp_sources:
             url = f"{self.base_mirror}/{archive_name}/{timestamp}"
-            basemirror = f"deb {url} {suite_name} {component_name}"
+            basemirror = f"deb [trusted=yes] {url} {suite_name} {component_name}"
             release_url = f"{url}/dists/{suite_name}/Release"
+            logger.debug(f"Checking release URL: {release_url}")
+
             resp = self.get_response(release_url)
             if resp.ok:
+                logger.debug(f"Found valid base mirror: {basemirror}")
                 return basemirror
+            else:
+                logger.debug(f"Release URL {release_url} is not valid")
 
+        logger.error("Cannot determine base mirror to use")
         raise RebuilderException("Cannot determine base mirror to use")
 
     def get_build_dependency(self, name):
@@ -767,6 +976,8 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
         else:
             raise RebuilderException("Cannot determine what to build")
 
+        logger.debug(f"Determined build type: {build}")
+
         # Prepare mmdebstrap command
         cmd = [
             "env",
@@ -777,6 +988,8 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             "--arch={}".format(self.buildinfo.build_arch),
             "--include={}".format(" ".join(self.get_apt_build_depends())),
             "--variant=apt",
+            '--aptopt=Acquire::AllowInsecureRepositories "true"',
+            '--aptopt=Acquire::AllowUnauthenticated "true"',
             '--aptopt=Acquire::Check-Valid-Until "false"',
             '--aptopt=Acquire::http::Dl-Limit "1000";',
             '--aptopt=Acquire::https::Dl-Limit "1000";',
@@ -784,9 +997,12 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             '--aptopt=APT::Get::allow-downgrades "true";',
         ]
 
+        logger.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
+
         # Support for proxy
         if self.proxy:
             cmd += ['--aptopt=Acquire::http::proxy "{}";'.format(self.proxy)]
+            logger.debug(f"Added proxy to mmdebstrap command: {self.proxy}")
 
         # Use all Debian keyrings at the mmdebstrap initial phase
         cmd += ["--keyring=/usr/share/keyrings/"]
@@ -796,11 +1012,13 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             cmd += [
                 '--essential-hook=chroot "$1" sh -c "apt-get --yes install build-essential"'
             ]
+            logger.debug("Added build-essential installation to mmdebstrap command")
 
         # Add dependencies for running build as builduser
         cmd += [
             '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux"'
         ]
+        logger.debug("Added fakeroot and util-linux installation to mmdebstrap command")
 
         # Add Debian keyrings into mmdebstrap trusted keys after init phase
         cmd += [
@@ -808,42 +1026,38 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                 join(DEBIAN_KEYRINGS)
             )
         ]
-
-        # Copy extra keys and repository files
-        if self.extra_repository_keys:
-            cmd += [
-                "--essential-hook=copy-in {} /etc/apt/trusted.gpg.d/".format(
-                    join(self.extra_repository_keys)
-                )
-            ]
-
-        if self.extra_repository_files:
-            cmd += [
-                '--essential-hook=chroot "$1" sh -c "apt-get --yes install apt-transport-https ca-certificates"'
-            ]
+        logger.debug("Added Debian keyrings to mmdebstrap command")
 
         # Update APT cache with provided sources.list
+        sources_list_update_cmds = [
+            "rm /etc/apt/sources.list",
+            "echo '{}' >> /etc/apt/sources.list".format(
+                "\n".join(
+                    self.get_sources_list()
+                    + self.get_sources_list_timestamps()
+                )
+            ),
+            "apt-get update"
+        ]
+
         cmd += [
             '--essential-hook=chroot "$1" sh -c "{}"'.format(
-                " && ".join(
-                    [
-                        "rm /etc/apt/sources.list",
-                        "echo '{}' >> /etc/apt/sources.list".format(
-                            "\n".join(
-                                self.get_sources_list()
-                                + self.get_sources_list_timestamps()
-                            )
-                        ),
-                        "apt-get update",
-                    ]
-                )
+                " && ".join(sources_list_update_cmds)
             )
         ]
+        logger.debug("Added APT sources list update to mmdebstrap command")
+
+        # Add step to refresh keyrings inside the chroot
+        cmd += [
+            '--essential-hook=chroot "$1" sh -c "apt-key update"'
+        ]
+        logger.debug("Added apt-key update to mmdebstrap command")
 
         # Create builduser for running the build in mmdebstrap as builduser
         cmd += [
             '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/bash'
         ]
+        logger.debug("Added creation of builduser to mmdebstrap command")
 
         # In case of binNMU build, we add the changelog entry from buildinfo
         binnmucmds = []
@@ -855,6 +1069,7 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                 ),
                 "mv debian/changelog.debrebuild debian/changelog",
             ]
+            logger.debug("Added binNMU changelog entry to mmdebstrap command")
 
         # Prepare build directory and get package source
         cmd += [
@@ -868,8 +1083,7 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                             os.path.dirname(quote(self.buildinfo.get_build_path()))
                         ),
                         "dpkg-source --no-check -x /*.dsc {}".format(
-                            quote(self.buildinfo.get_build_path())
-                        ),
+                            quote(self.buildinfo.get_build_path()))
                     ]
                     + binnmucmds
                     + [
@@ -880,6 +1094,17 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                 )
             )
         ]
+        logger.debug("Added preparation of build directory and source package download to mmdebstrap command")
+
+        # Install downloaded packages
+        if self.downloaded_packages:
+            cmd += [
+                '--customize-hook=copy-in {} /tmp/'.format(
+                    " ".join(self.downloaded_packages)
+                ),
+                '--customize-hook=chroot "$1" sh -c "dpkg -i /tmp/*.deb && apt-get install -f -y"'
+            ]
+            logger.debug(f"Added installation of downloaded packages to mmdebstrap command")
 
         # Prepare build command
         cmd += [
@@ -894,6 +1119,7 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                 )
             )
         ]
+        logger.debug("Added build command to mmdebstrap command")
 
         cmd += [
             "--customize-hook=sync-out {} {}".format(
@@ -901,16 +1127,60 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             ),
             self.buildinfo.get_debian_suite(),
             "/dev/null",
-            self.get_chroot_basemirror(),
+            self.get_chroot_basemirror(),  # Ensure this method is defined and returns a valid URL
         ]
+        logger.debug("Added sync-out and final setup to mmdebstrap command")
 
-        logger.debug(" ".join(cmd))
-        if subprocess.run(cmd).returncode != 0:
-            raise RebuilderException("mmdebstrap failed")
+        logger.debug("Final mmdebstrap command: " + " ".join(cmd))
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            if 'Unable to find a source package for' in result.stderr or 'Cannot find version' in result.stderr:
+                logger.error(f"mmdebstrap failed to find the source package: {result.stderr}")
+                print("mmdebstrap failed to find the source package.")
+                source_url = input("Please provide the URL to the source tarball (e.g., http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz): ")
+                package_version = input("Please provide the package version: ")
+
+                # Download the source tarball
+                source_tarball = f"/tmp/{os.path.basename(source_url)}"
+                subprocess.run(["wget", "-O", source_tarball, source_url])
+
+                # Extract the tarball
+                extract_dir = f"/build/{os.path.basename(source_tarball).split('.orig.tar.gz')[0]}"
+                subprocess.run(["mkdir", "-p", extract_dir])
+                subprocess.run(["tar", "-xzf", source_tarball, "-C", extract_dir])
+
+                # Update buildinfo with the new version
+                self.buildinfo.source_version = package_version
+
+                # Retry the mmdebstrap command without the failing package version command
+                cmd = [part for part in cmd if 'apt-get source --only-source -d' not in part]
+                cmd += [
+                    '--customize-hook=chroot "$1" env sh -c "chown -R builduser:builduser /build"'
+                ]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                if result.returncode != 0:
+                    logger.error(f"mmdebstrap failed again with error: {result.stderr}")
+                    raise RebuilderException("mmdebstrap failed again")
+                else:
+                    logger.info(f"mmdebstrap completed successfully after manual source tarball specification: {result.stdout}")
+            else:
+                logger.error(f"mmdebstrap failed with error: {result.stderr}")
+                raise RebuilderException("mmdebstrap failed")
+        else:
+            logger.info(f"mmdebstrap completed successfully: {result.stdout}")
 
     def verify_checksums(self, output, new_buildinfo):
         status = True
         summary = {}
+        changed_packages = set()
+
+        # Identify changed packages
+        for pkg in self.buildinfo.build_depends + [self.buildinfo.source]:
+            new_pkg = next((npkg for npkg in new_buildinfo.build_depends if npkg['name'] == pkg['name']), None)
+            if new_pkg and new_pkg['version'] != pkg['version']:
+                changed_packages.add(pkg['name'])
+
         for alg in self.buildinfo.checksums.keys():
             checksums = self.buildinfo.checksums[alg]
             new_checksums = new_buildinfo.checksums[alg]
@@ -961,6 +1231,9 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                     logger.info(f"{alg}: {f['name']}: OK")
                 else:
                     status = False
+
+            # Remove checksums related to changed packages from summary
+            summary[alg] = {k: v for k, v in summary[alg].items() if k.split('/')[0] not in changed_packages}
 
         if not status:
             logger.error("Checksums: FAIL")
@@ -1038,8 +1311,9 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                     logger.error(f"Cannot generate diffoscope for {f}: {str(e)}")
 
     def run(self, builder, output):
-        # Predict new buildinfo name created by builder
-        # Based on dpkg/scripts/dpkg-genbuildinfo.pl
+        logger.debug("Starting the run function")
+
+        # Determine build architecture
         if self.buildinfo.architecture:
             build_arch = self.get_host_architecture()
         elif self.buildinfo.build_archall:
@@ -1048,15 +1322,17 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             build_arch = "source"
         else:
             raise RebuilderException("Nothing to build")
+        logger.debug(f"Build architecture determined: {build_arch}")
 
-        # Stage 0: Pre-checks
+        # Perform pre-checks
+        logger.debug("Starting pre-checks")
         for key in DEBIAN_KEYRINGS:
             if not os.path.exists(key):
-                raise RebuilderException(
-                    f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring anddebian-ports-archive-keyring.'"
-                )
+                logger.error(f"Cannot find keyring: {key}")
+                raise RebuilderException(f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring, and debian-ports-archive-keyring.")
+        logger.debug("Pre-checks completed")
 
-        # Stage 1: Parse provided buildinfo file and setup the rebuilder
+        # Initialize and find build dependencies
         try:
             if self.use_metasnap:
                 logger.debug("Use metasnap for getting required timestamps")
@@ -1089,7 +1365,6 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
         # for older version of dpkg <= 1.19.0, binNMU version is not included in the generate
         # buildinfo filename (see: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=869236)
         dpkg = self.get_build_dependency("dpkg")
-
         if self.buildinfo.logentry and dpkg and dpkg.version < "1.19.0":
             buildinfo_version = self.buildinfo.source_version
         else:
@@ -1102,9 +1377,8 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
                 f"Refusing to overwrite existing buildinfo file: {new_buildinfo_file}"
             )
 
-        logger.debug(f"New buildinfo file: {new_buildinfo_file}")
-
-        # Stage 2: Run the actual rebuild of provided buildinfo file
+        # Execute the build
+        logger.debug("Starting stage 2: Run the actual rebuild of provided buildinfo file")
         if builder == "none":
             return
         if builder == "mmdebstrap":
@@ -1117,9 +1391,12 @@ Binary::apt-get::Acquire::AllowInsecureRepositories "false";
             fd.write(json.dumps(summary))
         if not status:
             self.generate_diffoscope(output, summary)
+            logger.error("Checksum verification failed")
             raise RebuilderChecksumsError
         if self.gpg_sign_keyid:
             self.generate_intoto_metadata(output, new_buildinfo)
+        logger.debug("Post-build actions completed")
+
 
 
 def get_args():
@@ -1192,7 +1469,12 @@ def get_args():
     parser.add_argument(
         "--debug", action="store_true", help="Display logger debug messages."
     )
+    parser.add_argument(
+        "--custom-package",
+        help="Path to a custom package (source or binary) to use in the build",
+    )
     return parser.parse_args()
+
 
 
 def realpath(path):
