@@ -28,6 +28,7 @@ import time
 from shlex import quote, join
 import shutil
 import requests
+import glob
 
 import apt
 import apt_pkg
@@ -233,6 +234,7 @@ class RebuilderBuildInfo:
 
 class Rebuilder:
     def __init__(self, buildinfo_file, snapshot_url, snapshot_mirror, extra_repository_files=None, extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None, use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False, custom_package=None):
+        self.fallback_dsc_url = None
         self.buildinfo = None
         self.snapshot_url = snapshot_url
         self.base_mirror = f"{snapshot_mirror}/archive/"
@@ -967,6 +969,45 @@ APT::Authentication::TrustCDROM "true";
         return build_dependency
 
     def mmdebstrap(self, output):
+        # Define the build directory at the beginning of the function
+        build_dir = f"{self.tmpdir}/build"
+        if os.path.exists(build_dir):
+            shutil.rmtree(build_dir)
+        os.makedirs(build_dir, exist_ok=True)
+
+        # Source URLs for fallback
+        self.fallback_dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
+        self.fallback_orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
+        self.fallback_debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
+
+        # Prepare mmdebstrap command
+        cmd = self.generate_mmdebstrap_cmd(output)
+
+        logging.debug("Final mmdebstrap command: " + " ".join(cmd))
+
+        # Execute the initial mmdebstrap command
+        result = subprocess.run(cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            # Handle failure in finding the source package or version
+            logging.error(f"mmdebstrap failed with error: {result.stderr}")
+            raise RebuilderException("mmdebstrap failed")
+        else:
+            logging.info(f"mmdebstrap completed successfully: {result.stdout}")
+
+    def is_source_available(self):
+        # Implement the logic to check if the source package and version are available
+        source_check_cmd = [
+            "apt-get",
+            "source",
+            "--only-source",
+            "-d",
+            "{}={}".format(self.buildinfo.source, self.buildinfo.source_version)
+        ]
+        result = subprocess.run(source_check_cmd, capture_output=True, text=True)
+        return result.returncode == 0
+
+    def generate_mmdebstrap_cmd(self, output):
         if self.buildinfo.build_archany and self.buildinfo.build_archall:
             build = "any,all"
         elif self.buildinfo.build_archall:
@@ -978,9 +1019,8 @@ APT::Authentication::TrustCDROM "true";
         else:
             raise RebuilderException("Cannot determine what to build")
 
-        logger.debug(f"Determined build type: {build}")
+        logging.debug(f"Determined build type: {build}")
 
-        # Prepare mmdebstrap command
         cmd = [
             "env",
             "-i",
@@ -999,53 +1039,46 @@ APT::Authentication::TrustCDROM "true";
             '--aptopt=APT::Get::allow-downgrades "true";',
         ]
 
-        logger.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
+        logging.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
 
-        # Support for proxy
         if self.proxy:
             cmd += ['--aptopt=Acquire::http::proxy "{}";'.format(self.proxy)]
-            logger.debug(f"Added proxy to mmdebstrap command: {self.proxy}")
+            logging.debug(f"Added proxy to mmdebstrap command: {self.proxy}")
 
-        # Use all Debian keyrings at the mmdebstrap initial phase
         cmd += ["--keyring=/usr/share/keyrings/"]
 
-        # Workaround for missing build-essential in buildinfo dependencies
         if not self.get_build_dependency("build-essential"):
             cmd += [
                 '--essential-hook=chroot "$1" sh -c "apt-get --yes install build-essential"'
             ]
-            logger.debug("Added build-essential installation to mmdebstrap command")
+            logging.debug("Added build-essential installation to mmdebstrap command")
 
-        # Add dependencies for running build as builduser
         cmd += [
             '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg"'
         ]
-        logger.debug("Added fakeroot, util-linux, and gnupg installation to mmdebstrap command")
+        logging.debug("Added fakeroot, util-linux, and gnupg installation to mmdebstrap command")
 
-        # Add Debian keyrings into mmdebstrap trusted keys after init phase
         cmd += [
             "--essential-hook=copy-in {} /etc/apt/trusted.gpg.d/".format(
                 join(DEBIAN_KEYRINGS)
             )
         ]
-        logger.debug("Added Debian keyrings to mmdebstrap command")
+        logging.debug("Added Debian keyrings to mmdebstrap command")
 
-        # Copy extra keys and repository files
         if self.extra_repository_keys:
             cmd += [
                 "--essential-hook=copy-in {} /etc/apt/trusted.gpg.d/".format(
                     join(self.extra_repository_keys)
                 )
             ]
-            logger.debug("Added extra repository keys to mmdebstrap command")
+            logging.debug("Added extra repository keys to mmdebstrap command")
 
         if self.extra_repository_files:
             cmd += [
                 '--essential-hook=chroot "$1" sh -c "apt-get --yes install apt-transport-https ca-certificates"'
             ]
-            logger.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
+            logging.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
 
-        # Update APT cache with provided sources.list
         sources_list_update_cmds = [
             "rm /etc/apt/sources.list",
             "echo '{}' >> /etc/apt/sources.list".format(
@@ -1062,21 +1095,18 @@ APT::Authentication::TrustCDROM "true";
                 " && ".join(sources_list_update_cmds)
             )
         ]
-        logger.debug("Added APT sources list update to mmdebstrap command")
+        logging.debug("Added APT sources list update to mmdebstrap command")
 
-        # Add step to refresh keyrings inside the chroot
         cmd += [
             '--essential-hook=chroot "$1" sh -c "apt-key update"'
         ]
-        logger.debug("Added apt-key update to mmdebstrap command")
+        logging.debug("Added apt-key update to mmdebstrap command")
 
-        # Create builduser for running the build in mmdebstrap as builduser
         cmd += [
             '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/bash'
         ]
-        logger.debug("Added creation of builduser to mmdebstrap command")
+        logging.debug("Added creation of builduser to mmdebstrap command")
 
-        # In case of binNMU build, we add the changelog entry from buildinfo
         binnmucmds = []
         if self.buildinfo.logentry:
             binnmucmds += [
@@ -1086,125 +1116,38 @@ APT::Authentication::TrustCDROM "true";
                 ),
                 "mv debian/changelog.debrebuild debian/changelog",
             ]
-            logger.debug("Added binNMU changelog entry to mmdebstrap command")
+            logging.debug("Added binNMU changelog entry to mmdebstrap command")
 
-        # Prepare build directory and get package source
-        cmd += [
-            '--customize-hook=chroot "$1" env sh -c "{}"'.format(
-                " && ".join(
-                    [
-                        "apt-get source --only-source -d {}={}".format(
-                            self.buildinfo.source, self.buildinfo.source_version
-                        ),
-                        "mkdir -p {}".format(
-                            os.path.dirname(quote(self.buildinfo.get_build_path()))
-                        ),
-                        "dpkg-source --no-check -x /*.dsc {}".format(
-                            quote(self.buildinfo.get_build_path()))
-                    ]
-                    + binnmucmds
-                    + [
-                        "chown -R builduser:builduser {}".format(
-                            os.path.dirname(quote(self.buildinfo.get_build_path()))
-                        ),
-                    ]
-                )
-            )
-        ]
-        logger.debug("Added preparation of build directory and source package download to mmdebstrap command")
+        # Specify the custom directory names
+        custom_unpack_dir = "/build/src_dir"
 
-        # Install downloaded packages
-        if self.downloaded_packages:
+        # Download and unpack the source directly in the chroot environment
+        if not self.is_source_available():
             cmd += [
-                '--customize-hook=copy-in {} /tmp/'.format(
-                    " ".join(self.downloaded_packages)
-                ),
-                '--customize-hook=chroot "$1" sh -c "dpkg -i /tmp/*.deb && apt-get install -f -y"'
+                '--essential-hook=chroot "$1" sh -c "apt-get --yes install wget"',
+                '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
+                '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(dsc_url=self.fallback_dsc_url),
+                '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(orig_tar_url=self.fallback_orig_tar_url),
+                '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(debian_tar_url=self.fallback_debian_tar_url),
+                '--customize-hook=chroot "$1"ppp env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) {custom_unpack_dir}"'.format(dsc_url=self.fallback_dsc_url, custom_unpack_dir=custom_unpack_dir),
+                '--customize-hook=chroot "$1" env sh -c "chown -R builduser:builduser /build"',
+                '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "cd /build/src_dir && dpkg-buildpackage -uc -us -b"',
+                '--customize-hook=chroot "$1" sh -c "mv /build/*.buildinfo /build/src_dir/"',
+                '--customize-hook=chroot "$1" sh -c "mv /build/*.deb /build/src_dir/"'
             ]
-            logger.debug(f"Added installation of downloaded packages to mmdebstrap command")
+            logging.debug("Added preparation of build directory and source package download to mmdebstrap command")
 
-        # Prepare build command
+        # Revised sync-out command
+        output = "/home/arun/Desktop/debrebuild/artifacts"  # Ensure this is correctly defined or passed
         cmd += [
-            '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(
-                " && ".join(
-                    [
-                        "cd {}".format(quote(self.buildinfo.get_build_path())),
-                        "env {} dpkg-buildpackage -uc -a {} --build={}".format(
-                            " ".join(self.get_env()), self.buildinfo.host_arch, build
-                        ),
-                    ]
-                )
-            )
-        ]
-        logger.debug("Added build command to mmdebstrap command")
-
-        cmd += [
-            "--customize-hook=sync-out {} {}".format(
-                os.path.dirname(quote(self.buildinfo.get_build_path())), output
-            ),
+            '--customize-hook=sync-out {custom_unpack_dir} {output}'.format(custom_unpack_dir=custom_unpack_dir, output=output),
             self.buildinfo.get_debian_suite(),
             "/dev/null",
             self.get_chroot_basemirror(),  # Ensure this method is defined and returns a valid URL
         ]
-        logger.debug("Added sync-out and final setup to mmdebstrap command")
+        logging.debug("Added sync-out and final setup to mmdebstrap command")
 
-        logger.debug("Final mmdebstrap command: " + " ".join(cmd))
-
-        # Execute the initial mmdebstrap command
-        result = subprocess.run(cmd, capture_output=True, text=True)
-
-        if result.returncode != 0:
-            # Check for specific errors that require fetching the source package
-            if 'Unable to find a source package for' in result.stderr or 'Cannot find version' in result.stderr:
-                logger.error(f"mmdebstrap failed to find the source package: {result.stderr}")
-                print("mmdebstrap failed to find the source package.")
-                source_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
-                package_version = "1.10"
-
-                # Download the source tarball
-                source_tarball = f"/tmp/{os.path.basename(source_url)}"
-                response = requests.get(source_url)
-                with open(source_tarball, 'wb') as f:
-                    f.write(response.content)
-
-                # Create the directory with correct permissions
-                extract_dir = f"/tmp/{os.path.basename(source_tarball).split('.orig.tar.gz')[0]}"
-                os.makedirs(extract_dir, exist_ok=True)
-
-                # Extract the tarball
-                shutil.unpack_archive(source_tarball, extract_dir)
-
-                # Copy extracted sources to build directory
-                build_dir = f"{self.tmpdir}/build"
-                shutil.copytree(extract_dir, build_dir, dirs_exist_ok=True)
-
-                # Check if builduser exists, if not, create it
-                cmd_user_check = [
-                    '--customize-hook=chroot "$1" id -u builduser || useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/bash'
-                ]
-                # Execute the command to ensure builduser exists
-                user_result = subprocess.run(cmd_user_check, capture_output=True, text=True)
-                if user_result.returncode != 0:
-                    logger.error(f"Failed to ensure 'builduser' exists: {user_result.stderr}")
-                    raise RebuilderException("Failed to ensure 'builduser' exists. mmdebstrap cannot continue.")
-
-                # Change owner to builduser now that it definitely exists
-                shutil.chown(build_dir, user="builduser", group="builduser")
-
-                # Update buildinfo with the new version and retry mmdebstrap without the failing package version command
-                self.buildinfo.source_version = package_version
-                cmd = [part for part in cmd if 'apt-get source --only-source -d' not in part]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                if result.returncode != 0:
-                    logger.error(f"mmdebstrap failed again with error: {result.stderr}")
-                    raise RebuilderException("mmdebstrap failed again")
-                else:
-                    logger.info(f"mmdebstrap completed successfully after manual source tarball specification: {result.stdout}")
-            else:
-                logger.error(f"mmdebstrap failed with error: {result.stderr}")
-                raise RebuilderException("mmdebstrap failed")
-        else:
-            logger.info(f"mmdebstrap completed successfully: {result.stdout}")
+        return cmd
 
     def verify_checksums(self, output, new_buildinfo):
         status = True
@@ -1421,19 +1364,29 @@ APT::Authentication::TrustCDROM "true";
             self.mmdebstrap(output)
 
         # Stage 3: Everything post-build actions with rebuild artifacts
+        buildinfo_files = glob.glob(os.path.join(output, "*.buildinfo"))  # Find all .buildinfo files in the output directory
+
+        if not buildinfo_files:
+            logger.error("No buildinfo file found in the output directory.")
+            raise BuildInfoException("Cannot find any buildinfo file in the specified directory.")
+
+        # Assuming the most recently modified file if multiple, or the only file if one
+        new_buildinfo_file = max(buildinfo_files, key=os.path.getmtime)
         new_buildinfo = RebuilderBuildInfo(realpath(new_buildinfo_file))
+
         status, summary = self.verify_checksums(output, new_buildinfo)
-        with open(f"{output}/summary.out", "w") as fd:
+        with open(os.path.join(output, "summary.out"), "w") as fd:
             fd.write(json.dumps(summary))
+
         if not status:
             self.generate_diffoscope(output, summary)
             logger.error("Checksum verification failed")
             raise RebuilderChecksumsError
+
         if self.gpg_sign_keyid:
             self.generate_intoto_metadata(output, new_buildinfo)
+
         logger.debug("Post-build actions completed")
-
-
 
 def get_args():
     parser = argparse.ArgumentParser(
