@@ -136,33 +136,48 @@ class Package:
 
 
 class RebuilderBuildInfo:
-    def __init__(self, buildinfo_file):
+    def __init__(self, buildinfo_file, use_fallback=False):
+        logging.debug(f"Initializing RebuilderBuildInfo with file: {buildinfo_file}, use_fallback={use_fallback}")
+        if use_fallback:
+            directory = os.path.dirname(buildinfo_file) if not os.path.isdir(buildinfo_file) else buildinfo_file
+            self.buildinfo_path = self.find_new_buildinfo(directory)
+        else:
+            self.buildinfo_path = buildinfo_file
 
-        if not os.path.exists(buildinfo_file):
-            raise BuildInfoException(f"Cannot find buildinfo file: {buildinfo_file}")
+        if not os.path.exists(self.buildinfo_path):
+            logging.error(f"Buildinfo file does not exist: {self.buildinfo_path}")
+            raise BuildInfoException(f"Cannot find buildinfo file: {self.buildinfo_path}")
 
-        with open(buildinfo_file) as fd:
+        with open(self.buildinfo_path) as fd:
             self.parsed_info = debian.deb822.BuildInfo(fd)
 
-        # in case of binnmu we have e.g.
-        #   Source: 0ad (0.0.23-1)
+        self.process_buildinfo()
+
+    @staticmethod
+    def find_new_buildinfo(directory):
+        logging.debug(f"Searching for new buildinfo files in directory: {directory}")
+        buildinfo_files = glob.glob(os.path.join(directory, "*.buildinfo"))
+        if not buildinfo_files:
+            logging.error("No buildinfo file found in the specified directory.")
+            raise BuildInfoException("No buildinfo file found in the specified directory.")
+        return max(buildinfo_files, key=os.path.getmtime)
+
+    def process_buildinfo(self):
+        logging.debug("Processing buildinfo content.")
         self.source, self.source_version = self.parsed_info.get_source()
-        self.architecture = [
-            arch
-            for arch in self.parsed_info.get_architecture()
-            if arch not in ("source", "all")
-        ]
+        self.architecture = [arch for arch in self.parsed_info.get_architecture() if arch not in ("source", "all")]
         if len(self.architecture) > 1:
+            logging.error("Multiple architectures found in Architecture field.")
             raise BuildInfoException("More than one architecture in Architecture field")
         self.binary = self.parsed_info.get_binary()
         self.version = self.parsed_info["version"]
-        if not self.source_version:
-            self.source_version = self.version
+        self.source_version = self.version if not self.source_version else self.source_version
         if ":" in self.version:
             self.version = self.version.split(":")[1]
         self.build_path = self.parsed_info.get("build-path", None)
         self.build_arch = self.parsed_info.get("build-architecture", None)
         if not self.build_arch:
+            logging.error("Build-Architecture field is missing.")
             raise BuildInfoException("Need Build-Architecture field")
         self.build_date = self.parsed_info.get_build_date().strftime("%Y%m%dT%H%M%SZ")
         self.host_arch = self.parsed_info.get("host-architecture", self.build_arch)
@@ -175,15 +190,12 @@ class RebuilderBuildInfo:
         for alg in ("md5", "sha1", "sha256", "sha512"):
             if self.parsed_info.get(f"checksums-{alg}", None):
                 self.checksums[alg] = self.parsed_info[f"checksums-{alg}"]
+                logging.debug(f"Checksums for {alg} loaded: {self.checksums[alg]}")
 
         self.logentry = self.parsed_info.get_changelog()
         if self.logentry:
-            # Due to storing the binnmu changelog entry in deb822 buildinfo,
-            # the first character is an unwanted newline
-            self.logentry = str(self.logentry).lstrip("\n")
-            # while the linebreak at the beginning is wrong, there are one
-            # missing at the end
-            self.logentry += "\n"
+            self.logentry = str(self.logentry).lstrip("\n") + "\n"
+            logging.debug("Processed changelog entry from binNMU.")
 
         self.build_depends = []
         self.required_timestamps = {}
@@ -191,6 +203,8 @@ class RebuilderBuildInfo:
         self.source_date = None
         self.suite_name = None
         self.component_name = None
+
+        logging.debug("RebuilderBuildInfo initialization complete.")
 
     def get_debian_suite(self):
         """Returns the Debian suite suited for debootstraping the build
@@ -1129,11 +1143,11 @@ APT::Authentication::TrustCDROM "true";
                 '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(dsc_url=self.fallback_dsc_url),
                 '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(orig_tar_url=self.fallback_orig_tar_url),
                 '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(debian_tar_url=self.fallback_debian_tar_url),
-                '--customize-hook=chroot "$1"ppp env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) {custom_unpack_dir}"'.format(dsc_url=self.fallback_dsc_url, custom_unpack_dir=custom_unpack_dir),
+                '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) src_dir"'.format(dsc_url=self.fallback_dsc_url),
                 '--customize-hook=chroot "$1" env sh -c "chown -R builduser:builduser /build"',
                 '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "cd /build/src_dir && dpkg-buildpackage -uc -us -b"',
-                '--customize-hook=chroot "$1" sh -c "mv /build/*.buildinfo /build/src_dir/"',
-                '--customize-hook=chroot "$1" sh -c "mv /build/*.deb /build/src_dir/"'
+                #'--customize-hook=chroot "$1" sh -c "mv /build/*.buildinfo /build/src_dir/"',
+                '--customize-hook=chroot "$1" sh -c "find /build -mindepth 1 -maxdepth 1 ! -name src_dir -exec mv {} /build/src_dir/ \;"'
             ]
             logging.debug("Added preparation of build directory and source package download to mmdebstrap command")
 
@@ -1153,71 +1167,54 @@ APT::Authentication::TrustCDROM "true";
         status = True
         summary = {}
         changed_packages = set()
+        use_new_buildinfo = not self.is_source_available()
+
+        logger.debug(f"Using new buildinfo: {use_new_buildinfo}")
 
         # Identify changed packages
+        logger.debug("Identifying changed packages...")
         for pkg in self.buildinfo.build_depends + [self.buildinfo.source]:
             new_pkg = next((npkg for npkg in new_buildinfo.build_depends if npkg['name'] == pkg['name']), None)
             if new_pkg and new_pkg['version'] != pkg['version']:
                 changed_packages.add(pkg['name'])
+                logger.debug(f"Package version changed: {pkg['name']} from {pkg['version']} to {new_pkg['version']}")
 
         for alg in self.buildinfo.checksums.keys():
             checksums = self.buildinfo.checksums[alg]
-            new_checksums = new_buildinfo.checksums[alg]
+            new_checksums = new_buildinfo.checksums.get(alg, {})
             files = [f for f in checksums if not f["name"].endswith(".dsc")]
             new_files = [f for f in new_checksums if not f["name"].endswith(".dsc")]
+
             summary.setdefault(alg, {})
 
-            if len(files) != len(new_files):
-                logger.debug(f"old buildinfo: {' '.join(files)}")
-                logger.debug(f"new buildinfo: {' '.join(new_files)}")
-                raise RebuilderException(
-                    f"New buildinfo contains a different number of files in {alg} checksums."
-                )
-
             for f in files:
-                new_file = None
-                for nf in new_files:
-                    if nf["name"] == f["name"]:
-                        new_file = nf
-                        break
+                new_file = next((nf for nf in new_files if nf["name"].startswith(f["name"].split('_')[0])), None)
                 if not new_file:
-                    raise RebuilderException(
-                        f"{alg}: Cannot find {f['name']} in new files"
-                    )
-                summary[alg].setdefault(f["name"], {})
+                    logger.error(f"{alg}: Cannot find equivalent for {f['name']} in new files")
+                    raise RebuilderException(f"{alg}: Cannot find equivalent for {f['name']} in new files")
+                summary[alg].setdefault(new_file["name"], {})
                 cur_status = True
-                for prop in f.keys():
-                    if prop not in new_file.keys():
-                        raise RebuilderException(
-                            f"{alg}: '{prop}' is not used in both buildinfo files"
-                        )
+
+                for prop in f:
+                    if prop not in new_file:
+                        logger.error(f"{alg}: Property {prop} missing in new file for {f['name']}")
+                        raise RebuilderException(f"{alg}: '{prop}' is not used in both buildinfo files")
+
                     if prop != "name":
-                        summary[alg][f["name"]][prop] = {
-                            "old": f[prop],
-                            "new": new_file[prop],
-                        }
-                    if prop == "size":
-                        if f["size"] != new_file["size"]:
-                            logger.error(f"{alg}: Size differs for {f['name']}")
+                        summary[alg][new_file["name"]][prop] = {"old": f[prop], "new": new_file[prop]}
+                        if f[prop] != new_file[prop]:
+                            logger.error(f"{alg}: Value of '{prop}' differs for {f['name']} (old: {f[prop]}, new: {new_file[prop]})")
                             cur_status = False
-                        continue
-                    if f[prop] != new_file[prop]:
-                        logger.error(
-                            f"{alg}: Value of '{prop}' differs for {f['name']}"
-                        )
-                        cur_status = False
+
                 if cur_status:
-                    logger.info(f"{alg}: {f['name']}: OK")
+                    logger.info(f"{alg}: {new_file['name']}: OK")
                 else:
                     status = False
 
-            # Remove checksums related to changed packages from summary
-            summary[alg] = {k: v for k, v in summary[alg].items() if k.split('/')[0] not in changed_packages}
-
         if not status:
-            logger.error("Checksums: FAIL")
+            logger.error("Checksum verification failed")
         else:
-            logger.info("Checksums: OK")
+            logger.info("Checksum verification succeeded")
 
         return status, summary
 
@@ -1293,100 +1290,90 @@ APT::Authentication::TrustCDROM "true";
         logger.debug("Starting the run function")
 
         # Determine build architecture
+        logger.debug("Determining build architecture...")
         if self.buildinfo.architecture:
             build_arch = self.get_host_architecture()
+            logger.debug(f"Determined build architecture from buildinfo: {build_arch}")
         elif self.buildinfo.build_archall:
             build_arch = "all"
+            logger.debug("Building for all architectures.")
         elif self.buildinfo.build_source:
             build_arch = "source"
+            logger.debug("Building from source.")
         else:
+            logger.error("Failed to determine what to build.")
             raise RebuilderException("Nothing to build")
-        logger.debug(f"Build architecture determined: {build_arch}")
 
         # Perform pre-checks
-        logger.debug("Starting pre-checks")
+        logger.debug("Performing pre-checks for keyrings...")
         for key in DEBIAN_KEYRINGS:
             if not os.path.exists(key):
-                logger.error(f"Cannot find keyring: {key}")
+                logger.error(f"Keyring not found: {key}")
                 raise RebuilderException(f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring, and debian-ports-archive-keyring.")
-        logger.debug("Pre-checks completed")
+        logger.debug("Keyring pre-checks completed successfully.")
 
         # Initialize and find build dependencies
+        logger.debug("Initializing and finding build dependencies...")
         try:
             if self.use_metasnap:
-                logger.debug("Use metasnap for getting required timestamps")
+                logger.debug("Using metasnap for getting required timestamps.")
                 self.find_build_dependencies_from_metasnap()
             if not self.required_timestamp_sources:
-                logger.debug("Use snapshot for getting required timestamps")
-                # If we failed at getting required timestamps from metasnap, we fallback
-                # to standard method. It means the code needs to know that we don't use metasnap
-                # to solve some dependency issues.
-                self.use_metasnap = False
+                logger.debug("Using standard snapshot method for getting required timestamps.")
                 self.find_build_dependencies()
-        except (
-            apt_pkg.Error,
-            apt.cache.FetchFailedException,
-            requests.exceptions.ConnectionError,
-        ) as e:
+        except (apt_pkg.Error, apt.cache.FetchFailedException, requests.exceptions.ConnectionError) as e:
+            logger.error(f"Failed to fetch packages: {str(e)}")
             raise RebuilderException(f"Failed to fetch packages: {str(e)}")
         except KeyboardInterrupt:
+            logger.error("Operation interrupted by user.")
             raise RebuilderException("Interruption")
-        finally:
-            if self.tempaptdir and self.tempaptdir.startswith(
-                os.path.join(self.tmpdir, "debrebuild-")
-            ):
-                if self.tempaptcache:
-                    self.tempaptcache.close()
-                shutil.rmtree(self.tempaptdir)
-            if self.buildinfo_file.startswith(os.path.join(self.tmpdir, "buildinfo-")):
-                os.remove(self.buildinfo_file)
 
-        # for older version of dpkg <= 1.19.0, binNMU version is not included in the generate
-        # buildinfo filename (see: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=869236)
-        dpkg = self.get_build_dependency("dpkg")
-        if self.buildinfo.logentry and dpkg and dpkg.version < "1.19.0":
-            buildinfo_version = self.buildinfo.source_version
-        else:
-            buildinfo_version = self.buildinfo.version
-
-        # path of the new buildinfo file generated by the rebuild in artifacts directory
-        new_buildinfo_file = f"{output}/{self.buildinfo.source}_{buildinfo_version}_{build_arch}.buildinfo"
-        if os.path.exists(new_buildinfo_file):
-            raise RebuilderException(
-                f"Refusing to overwrite existing buildinfo file: {new_buildinfo_file}"
-            )
+        # Clean up
+        logger.debug("Cleaning up temporary directories...")
+        if self.tempaptdir and self.tempaptdir.startswith(os.path.join(self.tmpdir, "debrebuild-")):
+            if self.tempaptcache:
+                self.tempaptcache.close()
+            shutil.rmtree(self.tempaptdir)
+            logger.debug("Temporary directories cleaned up.")
 
         # Execute the build
-        logger.debug("Starting stage 2: Run the actual rebuild of provided buildinfo file")
+        logger.debug("Starting the actual rebuild...")
         if builder == "none":
+            logger.debug("No builder specified, skipping build.")
             return
         if builder == "mmdebstrap":
+            logger.debug("Using mmdebstrap for building.")
             self.mmdebstrap(output)
 
-        # Stage 3: Everything post-build actions with rebuild artifacts
-        buildinfo_files = glob.glob(os.path.join(output, "*.buildinfo"))  # Find all .buildinfo files in the output directory
-
+        # Post-build actions
+        logger.debug("Finding buildinfo files in output directory...")
+        buildinfo_files = glob.glob(os.path.join(output, "*.buildinfo"))
         if not buildinfo_files:
             logger.error("No buildinfo file found in the output directory.")
             raise BuildInfoException("Cannot find any buildinfo file in the specified directory.")
 
-        # Assuming the most recently modified file if multiple, or the only file if one
         new_buildinfo_file = max(buildinfo_files, key=os.path.getmtime)
-        new_buildinfo = RebuilderBuildInfo(realpath(new_buildinfo_file))
+        logger.debug(f"Using buildinfo file: {new_buildinfo_file}")
+
+        if self.is_source_available():
+            new_buildinfo = RebuilderBuildInfo(realpath(new_buildinfo_file), False)
+        else:
+            new_buildinfo = RebuilderBuildInfo(realpath(new_buildinfo_file), True)
 
         status, summary = self.verify_checksums(output, new_buildinfo)
         with open(os.path.join(output, "summary.out"), "w") as fd:
             fd.write(json.dumps(summary))
 
         if not status:
+            logger.error("Checksum verification failed.")
             self.generate_diffoscope(output, summary)
-            logger.error("Checksum verification failed")
             raise RebuilderChecksumsError
 
         if self.gpg_sign_keyid:
+            logger.debug("Generating in-toto metadata.")
             self.generate_intoto_metadata(output, new_buildinfo)
 
-        logger.debug("Post-build actions completed")
+        logger.debug("Post-build actions completed successfully.")
 
 def get_args():
     parser = argparse.ArgumentParser(
