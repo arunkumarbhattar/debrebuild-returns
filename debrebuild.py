@@ -791,6 +791,22 @@ class Rebuilder:
             logging.error(f"Packages file {packages_file}.gz does not exist.")
             return False
 
+        # Modify the Filename field to use relative paths
+        try:
+            with open(packages_file, "r") as f:
+                lines = f.readlines()
+            with open(packages_file, "w") as f:
+                for line in lines:
+                    if line.startswith("Filename: "):
+                        f.write(f"Filename: ./{line.split('/')[-1]}\n")
+                    else:
+                        f.write(line)
+            subprocess.run(["gzip", "-kf", packages_file], check=True)
+            logging.debug(f"Updated Filename paths in Packages file and recompressed it.")
+        except Exception as e:
+            logging.error(f"Failed to update the Filename paths in the Packages file: {e}")
+            return False
+
         # Add the local repository to the sources list if not already present
         local_repo_entry = f"deb [trusted=yes] file://{local_repo_dir} ./"
         temp_sources_list = os.path.join(self.tempaptdir, "etc/apt/sources.list")
@@ -804,38 +820,43 @@ class Rebuilder:
                 fd.flush()
                 self.newly_added_sources.append(local_repo_entry)
 
+        # Update the APT cache
         try:
-            # Update the APT cache
             self.tempaptcache.close()  # Ensure cache is closed before updating
             logging.debug("try_direct_through_deb::APT cache closed successfully.")
             self.tempaptcache.update(sources_list=temp_sources_list)
             logging.debug("try_direct_through_deb::APT cache update called.")
             self.tempaptcache.open()  # Reopen cache after update
             logging.debug("try_direct_through_deb::APT cache reopened successfully.")
-
-            # Check if the package is found in the updated cache
-            pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
-            if pkg and notfound_pkg.version in pkg.versions.keys():
-                print(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} found in APT cache.")
-                return True  # Package found, return True
-            else:
-                logging.debug(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found.")
-
         except Exception as e:
             logging.error(f"Error updating APT cache: {e}")
-        finally:
-            # Remove the added source list entry if the package is not found
+            return False
+
+        # Check if the package is found in the updated cache
+        pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+        if pkg and notfound_pkg.version in pkg.versions.keys():
+            logging.debug(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} found in APT cache.")
             with open(temp_sources_list, "r+") as fd:
                 lines = fd.readlines()
                 fd.seek(0)
                 fd.writelines([line for line in lines if line.strip() != local_repo_entry])
                 fd.truncate()
                 fd.flush()
-                if local_repo_entry in self.newly_added_sources:
-                    self.newly_added_sources.remove(local_repo_entry)
-            print(f"try_direct_through_deb::Reverted changes to sources list.")
+                self.newly_added_sources.remove(local_repo_entry)
+            return True  # Package found, return True
+
+        # Remove the added source list entry if the package is not found
+        with open(temp_sources_list, "r+") as fd:
+            lines = fd.readlines()
+            fd.seek(0)
+            fd.writelines([line for line in lines if line.strip() != local_repo_entry])
+            fd.truncate()
+            fd.flush()
+            self.newly_added_sources.remove(local_repo_entry)
+        logging.debug(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found. Reverting changes.")
 
         return False
+
 
     def try_snapshot_sources(self, notfound_pkg):
         # Dynamically generate snapshot source links, add to sources list, check, and clean up if not found
@@ -1201,14 +1222,37 @@ APT::Authentication::TrustCDROM "true";
         local_repo_dir = "/tmp/local_repo"
         packages_file = os.path.join(local_repo_dir, "Packages.gz")
 
-        if os.path.exists(local_repo_dir) and os.path.exists(packages_file):
-            # Copy local repository to the chroot environment
+        # Copy local repository to the chroot environment and set up sources.list
+        if os.path.exists("/tmp/local_repo") and os.path.exists("/tmp/local_repo/Packages"):
             cmd += [
-                f'--essential-hook=copy-in {local_repo_dir} /mnt/local_repo',
+                f'--essential-hook=copy-in /tmp/local_repo /mnt/local_repo',
+                '--essential-hook=chroot "$1" mkdir -p /mnt/local_repo',
                 '--essential-hook=chroot "$1" sh -c "rm /etc/apt/sources.list && echo \'deb [trusted=yes] file:///mnt/local_repo ./\' > /etc/apt/sources.list"',
                 '--essential-hook=chroot "$1" sh -c "apt-get update"',
             ]
             logging.debug("Added local repository setup to mmdebstrap command")
+
+        cmd += ['--essential-hook=chroot "$1" sh -c "apt-key update"']
+        logging.debug("Added apt-key update to mmdebstrap command")
+
+        cmd += [
+            '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/bash'
+        ]
+        logging.debug("Added creation of builduser to mmdebstrap command")
+
+        # In case of binNMU build, we add the changelog entry from buildinfo
+        binnmucmds = []
+        if self.buildinfo.logentry:
+            binnmucmds += [
+                "cd {}".format(quote(self.buildinfo.get_build_path())),
+                "{{ printf '%s' {}; cat debian/changelog; }} > debian/changelog.debrebuild".format(
+                    quote(self.buildinfo.logentry)
+                ),
+                "mv debian/changelog.debrebuild debian/changelog",
+            ]
+
+        # Specify the custom directory names
+        custom_unpack_dir = "/build/src_dir"
 
         # Add preparation of build directory and source package download
         if not self.is_source_available():
