@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from shlex import quote, join
 import shutil
 import requests
@@ -682,24 +683,118 @@ class Rebuilder:
                                     notfound_packages.remove(notfound_pkg)
                                 else:
                                     logger.debug(f"find_build_dependencies::Exact package-version {notfound_pkg.to_apt_install_format()} not found. Searching in snapshot sources.")
-                                    # Dynamic snapshot source handling
+                                    # Call the new function before trying snapshot sources
+                                    found_direct = self.try_direct_through_deb(notfound_pkg)
+                                    if found_direct:
+                                        notfound_packages.remove(notfound_pkg)
+                                    else:
+                                        found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
+                                        if found_in_snapshots:
+                                            notfound_packages.remove(notfound_pkg)
+                                        else:
+                                            logging.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
+                            else:
+                                logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} ITSELF not found. Searching in snapshot sources.")
+                                # Call the new function before trying snapshot sources
+                                found_direct = self.try_direct_through_deb(notfound_pkg)
+                                if found_direct:
+                                    notfound_packages.remove(notfound_pkg)
+                                else:
                                     found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
                                     if found_in_snapshots:
                                         notfound_packages.remove(notfound_pkg)
                                     else:
-                                        logger.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
-                            else:
-                                logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} ITSELF not found. Searching in snapshot sources.")
-                                    # Dynamic snapshot source handling
-                                found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
-                                if found_in_snapshots:
-                                    notfound_packages.remove(notfound_pkg)
-                                else:
-                                    logger.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
+                                        logging.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
 
                         self.tempaptcache.close()
                         logger.debug("find_build_dependencies::Closed APT cache")
         logger.debug("find_build_dependencies::Completed find_build_dependencies")
+
+
+    def try_direct_through_deb(self, notfound_pkg):
+        package_name_version = notfound_pkg.to_apt_install_format()
+        package_name = package_name_version.split('=')[0]
+        package_url = f"https://packages.debian.org/sid/amd64/{package_name}/download"
+
+        try:
+            response = requests.get(package_url)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logging.error(f"Failed to fetch the package download page: {e}")
+            return False
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        deb_link = None
+        for link in soup.find_all('a'):
+            href = link.get('href')
+            if "ftp.us.debian.org/debian" in href:
+                deb_link = href
+                break
+
+        if not deb_link:
+            logging.error("Failed to find the .deb file link on the download page.")
+            return False
+
+        deb_file_path = "/tmp/package.deb"
+        try:
+            with requests.get(deb_link, stream=True) as r:
+                r.raise_for_status()
+                with open(deb_file_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
+        except requests.RequestException as e:
+            logging.error(f"Failed to download the .deb file: {e}")
+            return False
+
+        # Create a local repository and add the .deb file to it
+        unique_id = uuid.uuid4().hex
+        local_repo_dir = f"/tmp/local_repo_{unique_id}"
+        os.makedirs(local_repo_dir, exist_ok=True)
+        subprocess.run(["cp", deb_file_path, local_repo_dir], check=True)
+        subprocess.run(["dpkg-scanpackages", local_repo_dir, "/dev/null"], stdout=open(f"{local_repo_dir}/Packages", "w"), check=True)
+        subprocess.run(["gzip", "-k", f"{local_repo_dir}/Packages"], check=True)
+
+        # Add the local repository to the sources list
+        local_repo_entry = f"deb [trusted=yes] file://{local_repo_dir} ./"
+        temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
+        with open(temp_sources_list, "a") as fd:
+            fd.write(f"{local_repo_entry}\n")
+            fd.flush()
+            self.newly_added_sources.append(local_repo_entry)
+
+        # Update the APT cache
+        try:
+            self.tempaptcache.close()  # Ensure cache is closed before updating
+            print(f"try_direct_through_deb::APT cache closed successfully.")
+            self.tempaptcache.update(sources_list=temp_sources_list)
+            print(f"try_direct_through_deb::APT cache update called.")
+            self.tempaptcache.open()  # Reopen cache after update
+            print(f"try_direct_through_deb::APT cache reopened successfully.")
+        except Exception as e:
+            logging.error(f"Error updating APT cache: {e}")
+            os.remove(deb_file_path)
+            return False
+
+        # Check if the package is found in the updated cache
+        pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+        if pkg and notfound_pkg.version in pkg.versions.keys():
+            print(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} found in APT cache.")
+            os.remove(deb_file_path)
+            return True  # Package found, return True
+
+        # If package is not found, revert the changes in the sources list
+        self.tempaptcache.close()
+        with open(temp_sources_list, "r+") as fd:
+            lines = fd.readlines()
+            fd.seek(0)
+            fd.writelines(lines[:-1])  # Remove the last line added for the local repo entry
+            fd.truncate()
+            fd.flush()
+            self.newly_added_sources = self.newly_added_sources[:-1]
+        print(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found. Reverting changes.")
+
+        os.remove(deb_file_path)
+        return False
 
     def try_snapshot_sources(self, notfound_pkg):
         # Dynamically generate snapshot source links, add to sources list, check, and clean up if not found
