@@ -249,6 +249,8 @@ class RebuilderBuildInfo:
 
 class Rebuilder:
     def __init__(self, buildinfo_file, snapshot_url, snapshot_mirror, extra_repository_files=None, extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None, use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False, custom_package=None):
+        self.create_docker_image = None
+        self.use_docker_image = None
         self.fallback_dsc_url = None
         self.buildinfo = None
         self.snapshot_url = snapshot_url
@@ -389,9 +391,10 @@ class Rebuilder:
 
         # Mapping the retrieved source_info fields to buildinfo object
         self.buildinfo.archive_name = "debian"
+        #self.buildinfo.archive_name = source_info["archive_name"]
         self.buildinfo.source_date = source_info["first_seen"]
 
-        # Assuming 'sid' and 'main' as defaults if they cannot be determined from the path
+        # Assuming 'buster' and 'main' as defaults if they cannot be determined from the path
         self.buildinfo.suite_name = "sid"  # Replace with actual logic if available
         self.buildinfo.component_name = "main"  # Replace with actual logic if available
 
@@ -675,67 +678,77 @@ class Rebuilder:
                             if pkg is not None:
                                 available_versions = pkg.versions.keys()
                                 if notfound_pkg.version in available_versions:
-                                    logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
+                                    logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
                                     notfound_packages.remove(notfound_pkg)
                                 else:
-                                    logger.debug(f"Exact package {notfound_pkg.to_apt_install_format()} not found. Searching in snapshot sources.")
+                                    logger.debug(f"find_build_dependencies::Exact package-version {notfound_pkg.to_apt_install_format()} not found. Searching in snapshot sources.")
                                     # Dynamic snapshot source handling
                                     found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
                                     if found_in_snapshots:
                                         notfound_packages.remove(notfound_pkg)
                                     else:
-                                        logger.debug(f"Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
+                                        logger.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
                             else:
-                                logger.debug(f"Package {notfound_pkg.to_apt_install_format()} not found in APT cache")
+                                logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} ITSELF not found. Searching in snapshot sources.")
+                                    # Dynamic snapshot source handling
+                                found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
+                                if found_in_snapshots:
+                                    notfound_packages.remove(notfound_pkg)
+                                else:
+                                    logger.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
 
                         self.tempaptcache.close()
-                        logger.debug("Closed APT cache")
-        logger.debug("Completed find_build_dependencies")
+                        logger.debug("find_build_dependencies::Closed APT cache")
+        logger.debug("find_build_dependencies::Completed find_build_dependencies")
 
     def try_snapshot_sources(self, notfound_pkg):
         # Dynamically generate snapshot source links, add to sources list, check, and clean up if not found
-        years = range(2020, 2023)  # Example range, adjust as needed
+        years = range(2024, 2018, -1)  # Example range, adjust as needed
         for year in years:
             temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
+            logging.debug(f"try_snapshot_sources::temp_sources_list is {temp_sources_list}.")
 
-            for month in range(1, 13):  # Iterate over all months
+            for month in range(1, 13, 3):  # Iterate over all every 3 months
                 snapshot_sources = self.find_packages_in_snapshots(year, month)
+                if snapshot_sources:
+                    with open(temp_sources_list, "a") as fd:
+                        for source in snapshot_sources:
+                            fd.write(f"{source}\n")  # Write each source with a newline
+                            fd.flush()
+                            self.newly_added_sources.append(source)
 
-                with open(temp_sources_list, "a") as fd:
-                    for source in snapshot_sources:
-                        fd.write(f"{source}\n")  # Write each source with a newline
+                    # Update the APT cache after adding each month's sources
+                    try:
+                        self.tempaptcache.close()  # Ensure cache is closed before updating
+                        print(f"try_snapshot_sources::APT cache closed successfully for {year}-{month}.")
+                        self.tempaptcache.update(sources_list=temp_sources_list)
+                        print(f"try_snapshot_sources::APT cache update called for {year}-{month}.")
+                        self.tempaptcache.open()  # Reopen cache after update
+                        print(f"try_snapshot_sources::APT cache reopened successfully for {year}-{month}.")
+                    except Exception as e:
+                        logging.error(f"Error updating APT cache for {year}-{month}: {e}")
+                        raise  # Re-raise the exception to handle it at a higher level or to halt the program
+
+                    # Attempt to find the package in the updated cache
+                    pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
+                    if pkg and notfound_pkg.version in pkg.versions.keys():
+                        print(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
+                        return True  # Package found, return True and the current year
+
+                    # If package is not found, close the cache and revert the sources list
+                    self.tempaptcache.close()
+                    with open(temp_sources_list, "r+") as fd:
+                        lines = fd.readlines()
+                        fd.seek(0)
+                        # Remove the entries added for this month only
+                        fd.writelines(lines[:-len(snapshot_sources)])
+                        fd.truncate()
                         fd.flush()
-                        self.newly_added_sources.append(source)
+                        self.newly_added_sources = self.newly_added_sources[:-len(snapshot_sources)]
+                    print(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
 
-                # Update the APT cache after adding each month's sources
-                try:
-                    self.tempaptcache.close()  # Ensure cache is closed before updating
-                    logging.debug("APT cache closed successfully.")
-                    self.tempaptcache.update(sources_list=temp_sources_list)
-                    logging.debug("APT cache update called.")
-                    self.tempaptcache.open()  # Reopen cache after update
-                    logging.debug("APT cache reopened successfully.")
-                except Exception as e:
-                    logging.error(f"Error updating APT cache: {e}")
-                    raise  # Re-raise the exception to handle it at a higher level or to halt the program
+        return False  # Return False and the decremented year
 
-                # Attempt to find the package in the updated cache
-                pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
-                if pkg and notfound_pkg.version in pkg.versions.keys():
-                    return True  # Package found, keep the added sources
-
-                # If package is not found, close the cache and revert the sources list
-                self.tempaptcache.close()
-                with open(temp_sources_list, "r+") as fd:
-                    lines = fd.readlines()
-                    fd.seek(0)
-                    # Remove the entries added for this month only
-                    fd.writelines(lines[:-len(snapshot_sources)])
-                    fd.truncate()
-                    fd.flush()
-                    self.newly_added_sources = self.newly_added_sources[:-len(snapshot_sources)]
-
-        return False  # Return False if the package was not found after all attempts
 
     def fetch_all_available_timestamps(self, year, month):
         # Construct URL to fetch the page that lists all snapshots for a given month and year
@@ -745,13 +758,13 @@ class Rebuilder:
             soup = BeautifulSoup(response.text, 'html.parser')
             # Find all <a> tags which might contain the timestamps
             links = soup.find_all('a', href=True)  # Find all <a> tags with href attributes
-            # Extract timestamps and limit the number to 10
-            timestamps = [link['href'].strip('/') for link in links if 'T' in link['href']][:2]
+            # Extract timestamps and limit the number to 5
+            timestamps = [link['href'].strip('/') for link in links if 'T' in link['href']][:3]
             if timestamps:
-                logging.info(f"Available timestamps for {year}-{month} (limited to 10 or fewer): {timestamps}")
+                print(f"Available timestamps for {year}-{month} (limited to 6 or fewer): {timestamps}")
                 return timestamps
             else:
-                logging.error("No timestamps found on the page")
+                print(f"No timestamps found for {year}-{month}")
                 return []
         else:
             logging.error(f"Failed to retrieve data from snapshot.debian.org with status code: {response.status_code}")
@@ -766,6 +779,8 @@ class Rebuilder:
             return False
 
     def find_packages_in_snapshots(self, year, month):
+        if year == 2024 and month >= 7:
+            return []
         timestamps = self.fetch_all_available_timestamps(year, month)
         all_entries = []
         if timestamps:
@@ -783,10 +798,7 @@ class Rebuilder:
                 #print("deb_entry:", deb_entry)
 
                 release_url = f"{base_url}/{timestamp}/dists/{distribution}/Release"
-                if self.check_release_file_exists(release_url):
-                    all_entries.extend([deb_entry, deb_src_entry])
-                else:
-                    logging.warning(f"Release file not found for timestamp {timestamp}")
+                all_entries.extend([deb_entry, deb_src_entry])
 
                 logging.info("Constructed package source entries for all timestamps.")
                 return all_entries
@@ -937,10 +949,10 @@ APT::Authentication::TrustCDROM "true";
             shutil.rmtree(build_dir)
         os.makedirs(build_dir, exist_ok=True)
 
-        # Source URLs for fallback
-        self.fallback_dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
-        self.fallback_orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
-        self.fallback_debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
+        # # Source URLs for fallback
+        # self.fallback_dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
+        # self.fallback_orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
+        # self.fallback_debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
 
         # Prepare mmdebstrap command
         cmd = self.generate_mmdebstrap_cmd(output)
@@ -984,6 +996,15 @@ APT::Authentication::TrustCDROM "true";
 
         logging.debug(f"Determined build type: {build}")
 
+        if self.use_docker_image:
+            cmd = [
+                "docker", "run", "-v", f"{output}:/output", self.use_docker_image,
+                "/bin/bash", "-c",
+                f"cd {self.tmpdir} && dpkg-source --no-check -x /*.dsc && env {self.get_env()} dpkg-buildpackage -uc -a {self.buildinfo.host_arch} --build={build}"
+            ]
+            logging.debug(f"Using Docker image for build: {self.use_docker_image}")
+            return cmd
+
         cmd = [
             "env",
             "-i",
@@ -1026,13 +1047,6 @@ APT::Authentication::TrustCDROM "true";
         ]
 
         # Copy extra keys and repository files
-        if self.extra_repository_keys:
-            cmd += [
-                "--essential-hook=copy-in {} /etc/apt/trusted.gpg.d/".format(
-                    join(self.extra_repository_keys)
-                )
-            ]
-
         if self.extra_repository_keys:
             cmd += [
                 "--essential-hook=copy-in {} /etc/apt/trusted.gpg.d/".format(
@@ -1096,6 +1110,23 @@ APT::Authentication::TrustCDROM "true";
             env_vars = " ".join(self.get_env())
             host_arch = self.buildinfo.host_arch
             build = "binary"  # Replace with appropriate build type if needed
+            logging.debug("Source is unavailable")
+            dsc_url, orig_tar_url, debian_tar_url = self.fetch_debian_package_urls(self.buildinfo.source, self.buildinfo.source_version)
+
+            if not dsc_url or not orig_tar_url or not debian_tar_url:
+                # Prompt the user to provide source URLs for fallback
+                logging.warning("Unable to find URLs automatically, requesting user input.")
+                self.fallback_dsc_url = input("Please provide the URL for the .dsc file: ")
+                self.fallback_orig_tar_url = input("Please provide the URL for the .orig.tar.gz file: ")
+                self.fallback_debian_tar_url = input("Please provide the URL for the .debian.tar.xz file: ")
+            else:
+                self.fallback_dsc_url = dsc_url
+                self.fallback_orig_tar_url = orig_tar_url
+                self.fallback_debian_tar_url = debian_tar_url
+
+                print(f"DSC URL: {self.fallback_dsc_url}")
+                print(f"Original Tar URL: {self.fallback_orig_tar_url}")
+                print(f"Debian Tar URL: {self.fallback_debian_tar_url}")
 
             cmd += [
                 '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
@@ -1114,18 +1145,138 @@ APT::Authentication::TrustCDROM "true";
             ]
             logging.debug("Added preparation of build directory and source package download to mmdebstrap command")
 
-        # Revised sync-out command
-        output = "/home/arun/Desktop/debrebuild/artifacts"  # Ensure this is correctly defined or passed
-        cmd += [
-            '--customize-hook=sync-out {custom_unpack_dir} {output}'.format(custom_unpack_dir=custom_unpack_dir, output=output),
-            self.buildinfo.get_debian_suite(),
-            "/dev/null",
-            self.get_chroot_basemirror(),  # Ensure this method is defined and returns a valid URL
-        ]
-        logging.debug("Added sync-out and final setup to mmdebstrap command")
+            output = "/home/arun/Desktop/debrebuild/artifacts"
+            # Revised sync-out command
+            cmd += [
+                '--customize-hook=sync-out {custom_unpack_dir} {output}'.format(custom_unpack_dir=custom_unpack_dir, output=output),
+                self.buildinfo.get_debian_suite(),
+                "/dev/null",
+                self.get_chroot_basemirror(),  # Ensure this method is defined and returns a valid URL
+            ]
+            logging.debug("Added sync-out and final setup to mmdebstrap command")
+        else:
+            logging.debug("Source is available")
+            # Prepare build directory and get package source
+            cmd += [
+                '--customize-hook=chroot "$1" env sh -c "{}"'.format(
+                    " && ".join(
+                        [
+                            "apt-get source --only-source -d {}={}".format(
+                                self.buildinfo.source, self.buildinfo.source_version
+                            ),
+                            "mkdir -p {}".format(
+                                os.path.dirname(quote(self.buildinfo.get_build_path()))
+                            ),
+                            "dpkg-source --no-check -x /*.dsc {}".format(
+                                quote(self.buildinfo.get_build_path())
+                            ),
+                        ]
+                        + binnmucmds
+                        + [
+                            "chown -R builduser:builduser {}".format(
+                                os.path.dirname(quote(self.buildinfo.get_build_path()))
+                            ),
+                        ]
+                    )
+                )
+            ]
+
+            # Prepare build command
+            cmd += [
+                '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(
+                    " && ".join(
+                        [
+                            "cd {}".format(quote(self.buildinfo.get_build_path())),
+                            "env {} dpkg-buildpackage -uc -a {} --build={}".format(
+                                " ".join(self.get_env()), self.buildinfo.host_arch, build
+                            ),
+                        ]
+                    )
+                )
+            ]
+
+            cmd += [
+                "--customize-hook=sync-out {} {}".format(
+                    os.path.dirname(quote(self.buildinfo.get_build_path())), output
+                ),
+                self.buildinfo.get_debian_suite(),
+                "/dev/null",
+                self.get_chroot_basemirror(),
+            ]
+
+        if self.create_docker_image:
+            self.create_docker_snapshot()
 
         return cmd
 
+    def fetch_debian_package_urls(package_name, version):
+        base_url = "http://ftp.de.debian.org/debian/pool/main/"
+        if package_name.startswith("lib"):
+            package_url = f"{base_url}{package_name[:4]}/{package_name}/"
+        else:
+            package_url = f"{base_url}{package_name[0]}/{package_name}/"
+
+        try:
+            response = requests.get(package_url)
+            response.raise_for_status()
+        except requests.RequestException as e:
+            logging.error(f"Failed to fetch the package page: {e}")
+            return None, None, None
+
+        soup = BeautifulSoup(response.text, 'html.parser')
+        dsc_url = None
+        orig_tar_url = None
+        debian_tar_url = None
+
+        for link in soup.find_all('a'):
+            href = link.get('href')
+            if href and href.endswith(f"{version}.dsc"):
+                dsc_url = f"{package_url}{href}"
+            elif href and href.endswith(".orig.tar.gz") and version.split('-')[0] in href:
+                orig_tar_url = f"{package_url}{href}"
+            elif href and href.endswith(f"{version}.debian.tar.xz"):
+                debian_tar_url = f"{package_url}{href}"
+
+        return dsc_url, orig_tar_url, debian_tar_url
+
+
+    def create_docker_snapshot(self, cmd):
+        base_image = self.get_base_image()  # Determine the base Debian image from the current system
+
+        dockerfile_content = f"""
+        FROM {base_image}
+        RUN apt-get update && apt-get install -y fakeroot util-linux gnupg dirmngr wget
+        RUN {" && ".join(cmd)}
+        """
+        dockerfile_path = os.path.join(self.tmpdir, "Dockerfile")
+        with open(dockerfile_path, "w") as dockerfile:
+            dockerfile.write(dockerfile_content)
+
+        image_name = input("Please provide a name for the Docker image: ")
+
+        build_cmd = ["docker", "build", "-t", image_name, self.tmpdir]
+        result = subprocess.run(build_cmd, capture_output=True, text=True)
+
+        if result.returncode != 0:
+            logging.error(f"Docker build failed with error: {result.stderr}")
+            raise RebuilderException("Docker build failed")
+        else:
+            logging.info(f"Docker image {image_name} created successfully: {result.stdout}")
+
+    def get_base_image(self):
+        with open('/etc/os-release') as f:
+            lines = f.readlines()
+
+        version = None
+        for line in lines:
+            if line.startswith('VERSION_ID='):
+                version = line.split('=')[1].strip().strip('"')
+                break
+
+        if not version:
+            raise RebuilderException("Unable to determine Debian version from /etc/os-release")
+
+        return f"debian:{version}-slim"
     def verify_checksums(self, output, new_buildinfo):
         status = True
         summary = {}
