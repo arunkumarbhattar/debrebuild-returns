@@ -255,6 +255,7 @@ class RebuilderBuildInfo:
 
 class Rebuilder:
     def __init__(self, buildinfo_file, snapshot_url, snapshot_mirror, extra_repository_files=None, extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None, use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False, custom_package=None):
+        self.consider_local_repo = False
         self.create_docker_image = None
         self.use_docker_image = None
         self.fallback_dsc_url = None
@@ -636,88 +637,65 @@ class Rebuilder:
         return sources_list
 
     def find_build_dependencies(self):
-        logger.debug("Starting find_build_dependencies")
-
-        logger.debug("Preparing APT cache")
+        # Prepare APT cache for finding dependencies
         self.prepare_aptcache()
-        logger.debug("APT cache prepared")
 
         notfound_packages = [pkg for pkg in self.buildinfo.get_build_depends()]
-        logger.debug(f"Initial not found packages: {[pkg.to_apt_install_format() for pkg in notfound_packages]}")
-
         temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
-        batch_sources = []
-
         with open(temp_sources_list, "a") as fd:
-            for location, repositories in self.get_sources_list_from_timestamp().items():
+            for (
+                    location,
+                    repositories,
+            ) in self.get_sources_list_from_timestamp().items():
                 for timestamp_source, pkgs in repositories:
                     if not notfound_packages:
                         break
-
-                    if not any(pkg.to_apt_install_format() in [p.to_apt_install_format() for p in notfound_packages] for pkg in pkgs):
+                    if not any(
+                            pkg.to_apt_install_format()
+                            in [p.to_apt_install_format() for p in notfound_packages]
+                            for pkg in pkgs
+                    ):
                         logger.info(f"Skipping snapshot: {timestamp_source}")
                         continue
+                    logger.info(
+                        f"Remaining packages to be found: {len(notfound_packages)}"
+                    )
+                    self.required_timestamp_sources.setdefault(location, []).append(
+                        timestamp_source
+                    )
+                    logger.debug(
+                        f"Timestamp source ({len(pkgs)} packages): {timestamp_source}"
+                    )
+                    fd.write(f"\n{timestamp_source}")
+                    fd.flush()
 
-                    logger.info(f"Remaining packages to be found: {len(notfound_packages)}")
-                    self.required_timestamp_sources.setdefault(location, []).append(timestamp_source)
-                    logger.debug(f"Timestamp source ({len(pkgs)} packages): {timestamp_source}")
+                    # provides sources.list explicitly, otherwise `update()`
+                    # doesn't reload it until the next `open()`
+                    self.tempaptcache.update(sources_list=temp_sources_list)
+                    self.tempaptcache.open()
 
-                    trusted_source = f"deb  {timestamp_source.split()[1]} {timestamp_source.split()[2]} {timestamp_source.split()[3]}"
-                    batch_sources.append(trusted_source)
+                    for notfound_pkg in notfound_packages.copy():
+                        pkg = self.tempaptcache.get(
+                            f"{notfound_pkg.name}:{notfound_pkg.architecture}"
+                        )
+                        if (
+                                pkg is not None
+                                and pkg.versions.get(notfound_pkg.version) is not None
+                        ):
+                            notfound_packages.remove(notfound_pkg)
 
-                    if len(batch_sources) >= 10 or timestamp_source == repositories[-1][0]:
-                        for source in batch_sources:
-                            fd.write(f"{source}\n")
-                        fd.flush()
-                        logger.debug(f"Added {len(batch_sources)} sources to APT sources list: {batch_sources}")
-                        batch_sources = []
+                    self.tempaptcache.close()
 
-                        logger.debug("Updating APT cache with new sources list")
-                        self.tempaptcache.update(sources_list=temp_sources_list)
-                        self.tempaptcache.open()
-                        logger.debug("APT cache updated and opened")
+        if notfound_packages:
+            for notfound_pkg in notfound_packages:
+                logger.debug(
+                    f"{notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}"
+                )
+            raise RebuilderException(
+                "Cannot locate the following packages via "
+                "snapshots or the current repo/mirror"
+            )
 
-                        for notfound_pkg in notfound_packages.copy():
-                            logger.debug(f"Searching for package: {notfound_pkg.to_apt_install_format()} in APT cache")
-                            pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
-
-                            if pkg is not None:
-                                available_versions = pkg.versions.keys()
-                                if notfound_pkg.version in available_versions:
-                                    logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} found in APT cache")
-                                    notfound_packages.remove(notfound_pkg)
-                                else:
-                                    logger.debug(f"find_build_dependencies::Exact package-version {notfound_pkg.to_apt_install_format()} not found. Searching in snapshot sources.")
-                                    # Call the new function before trying snapshot sources
-                                    found_direct = self.try_direct_through_deb(notfound_pkg)
-                                    if found_direct:
-                                        notfound_packages.remove(notfound_pkg)
-                                    else:
-                                        raise PackageNotFoundException(notfound_pkg)
-                                    # else:
-                                    #     found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
-                                    #     if found_in_snapshots:
-                                    #         notfound_packages.remove(notfound_pkg)
-                                    #     else:
-                                    #         logging.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
-                            else:
-                                logger.debug(f"find_build_dependencies::Exact package {notfound_pkg.to_apt_install_format()} ITSELF not found. Searching in snapshot sources.")
-                                # Call the new function before trying snapshot sources
-                                found_direct = self.try_direct_through_deb(notfound_pkg)
-                                if found_direct:
-                                    notfound_packages.remove(notfound_pkg)
-                                else:
-                                    raise PackageNotFoundException(notfound_pkg)
-                                # else:
-                                    # found_in_snapshots = self.try_snapshot_sources(notfound_pkg)
-                                    # if found_in_snapshots:
-                                    #     notfound_packages.remove(notfound_pkg)
-                                    # else:
-                                    #     logging.debug(f"find_build_dependencies::Snapshot sources did not resolve package {notfound_pkg.to_apt_install_format()}.")
-
-                        self.tempaptcache.close()
-                        logger.debug("find_build_dependencies::Closed APT cache")
-        logger.debug("find_build_dependencies::Completed find_build_dependencies")
 
     def try_direct_through_deb(self, notfound_pkg):
         package_name_version = notfound_pkg.to_apt_install_format()
@@ -1113,11 +1091,6 @@ APT::Authentication::TrustCDROM "true";
             shutil.rmtree(build_dir)
         os.makedirs(build_dir, exist_ok=True)
 
-        # # Source URLs for fallback
-        # self.fallback_dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
-        # self.fallback_orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
-        # self.fallback_debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
-
         # Prepare mmdebstrap command
         cmd = self.generate_mmdebstrap_cmd(output)
 
@@ -1225,65 +1198,86 @@ APT::Authentication::TrustCDROM "true";
             ]
             logging.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
 
-        # Ensure the local repository directory exists
-        local_repo_dir = "/tmp/local_repo"
-        packages_file_src = os.path.join(local_repo_dir, "Packages")
+        if self.consider_local_repo:
+            print("DEBBIE")
+            # Ensure the local repository directory exists
+            local_repo_dir = "/tmp/local_repo"
+            packages_file_src = os.path.join(local_repo_dir, "Packages")
 
-        # Modify the Filename field in the Packages file to reflect the new path
-        try:
-            with open(packages_file_src, "r") as f:
-                lines = f.readlines()
+            # Modify the Filename field in the Packages file to reflect the new path
+            try:
+                with open(packages_file_src, "r") as f:
+                    lines = f.readlines()
 
-            # Debug: Log the original contents of the Packages file
-            logging.debug("Original Packages file contents:\n" + ''.join(lines))
+                # Debug: Log the original contents of the Packages file
+                logging.debug("Original Packages file contents:\n" + ''.join(lines))
 
-            with open(packages_file_src, "w") as f:
-                for line in lines:
-                    if line.startswith("Filename: "):
-                        # Ensure the Filename field uses the correct relative path
-                        relative_path = line.split('/')[-1].strip()
-                        f.write(f"Filename: /mnt/local_repo/{relative_path}\n")
-                    else:
-                        f.write(line)
+                with open(packages_file_src, "w") as f:
+                    for line in lines:
+                        if line.startswith("Filename: "):
+                            # Ensure the Filename field uses the correct relative path
+                            relative_path = line.split('/')[-1].strip()
+                            f.write(f"Filename: /mnt/local_repo/{relative_path}\n")
+                        else:
+                            f.write(line)
 
-            # Recompress the Packages file
-            subprocess.run(["gzip", "-kf", packages_file_src], check=True)
+                # Recompress the Packages file
+                subprocess.run(["gzip", "-kf", packages_file_src], check=True)
 
-            # Debug: Verify the updated Packages file contents
-            with open(packages_file_src, "r") as f:
-                updated_lines = f.readlines()
-            logging.debug("Updated Packages file contents:\n" + ''.join(updated_lines))
+                # Debug: Verify the updated Packages file contents
+                with open(packages_file_src, "r") as f:
+                    updated_lines = f.readlines()
+                logging.debug("Updated Packages file contents:\n" + ''.join(updated_lines))
 
-            # Debug: Verify the compressed Packages.gz file contents
-            packages_gz_path = packages_file_src + ".gz"
-            if os.path.exists(packages_gz_path):
-                with open(packages_gz_path, "rb") as f:
-                    compressed_contents = f.read()
-                logging.debug(f"Compressed Packages.gz file contents: {compressed_contents[:200]}... (truncated for brevity)")
-            else:
-                logging.error(f"Compressed Packages.gz file does not exist at {packages_gz_path}")
+                # Debug: Verify the compressed Packages.gz file contents
+                packages_gz_path = packages_file_src + ".gz"
+                if os.path.exists(packages_gz_path):
+                    with open(packages_gz_path, "rb") as f:
+                        compressed_contents = f.read()
+                    logging.debug(f"Compressed Packages.gz file contents: {compressed_contents[:200]}... (truncated for brevity)")
+                else:
+                    logging.error(f"Compressed Packages.gz file does not exist at {packages_gz_path}")
 
-            logging.debug(f"Updated Filename paths in Packages file and recompressed it.")
-        except Exception as e:
-            logging.error(f"Failed to update the Filename paths in the Packages file: {e}")
-            return False
+                logging.debug(f"Updated Filename paths in Packages file and recompressed it.")
+            except Exception as e:
+                logging.error(f"Failed to update the Filename paths in the Packages file: {e}")
+                return False
 
-        # Ensure the directory exists inside the chroot before copying the local repository
-        cmd += [
-            '--essential-hook=chroot "$1" mkdir -p /mnt/local_repo',
-            '--essential-hook=ls /tmp/local_repo',  # Verify the contents of the source directory
-            '--essential-hook=cp -r /tmp/local_repo/* "$1"/mnt/local_repo/',
-            '--essential-hook=ls "$1"/mnt/local_repo',  # Verify the contents of the target directory after copying
-            '--essential-hook=chroot "$1" sh -c "echo \'deb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',  # Append the new entry
-            '--essential-hook=chroot "$1" sh -c "apt-get update"',
-            '--essential-hook=chroot "$1" sh -c "apt-get install dpkg-dev -y"',  # Install dpkg-dev if not already installed
-            '--essential-hook=chroot "$1" sh -c "cd /mnt/local_repo && dpkg-scanpackages . | gzip -c > Packages.gz"',  # Generate Packages.gz
-            '--essential-hook=chroot "$1" sh -c "apt-get update"',  # Update apt after generating Packages.gz
-        ]
+            # Ensure the directory exists inside the chroot before copying the local repository
+            cmd += [
+                '--essential-hook=chroot "$1" mkdir -p /mnt/local_repo',
+                '--essential-hook=ls /tmp/local_repo',  # Verify the contents of the source directory
+                '--essential-hook=cp -r /tmp/local_repo/* "$1"/mnt/local_repo/',
+                '--essential-hook=ls "$1"/mnt/local_repo',  # Verify the contents of the target directory after copying
+                '--essential-hook=chroot "$1" sh -c "echo \'deb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',  # Append the new entry
+                '--essential-hook=chroot "$1" sh -c "apt-get update"',
+                '--essential-hook=chroot "$1" sh -c "apt-get install dpkg-dev -y"',  # Install dpkg-dev if not already installed
+                '--essential-hook=chroot "$1" sh -c "cd /mnt/local_repo && dpkg-scanpackages . | gzip -c > Packages.gz"',  # Generate Packages.gz
+                '--essential-hook=chroot "$1" sh -c "apt-get update"',  # Update apt after generating Packages.gz
+            ]
 
-        logging.debug("Added local repository setup to mmdebstrap command")
+            logging.debug("Added local repository setup to mmdebstrap command")
 
-        cmd += ['--essential-hook=chroot "$1" sh -c "apt-key update"']
+        else:
+            print("Not DEBBIE")
+            # Update APT cache with provided sources.list
+            cmd += [
+                '--essential-hook=chroot "$1" sh -c "{}"'.format(
+                    " && ".join(
+                        [
+                            "rm /etc/apt/sources.list",
+                            "echo '{}' >> /etc/apt/sources.list".format(
+                                "\n".join(
+                                    self.get_sources_list()
+                                    + self.get_sources_list_timestamps()
+                                )
+                            ),
+                            "apt-get update",
+                        ]
+                    )
+                )
+            ]
+
         logging.debug("Added apt-key update to mmdebstrap command")
 
         cmd += [
@@ -1312,10 +1306,10 @@ APT::Authentication::TrustCDROM "true";
             host_arch = self.buildinfo.host_arch
             build = "binary"  # Replace with appropriate build type if needed
             logging.debug("Source is unavailable")
-            #dsc_url, orig_tar_url, debian_tar_url = self.fetch_debian_package_urls(self.buildinfo.source, self.buildinfo.version)
-            dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.dsc"
-            orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.40.1.orig.tar.gz"
-            debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.debian.tar.xz"
+            dsc_url, orig_tar_url, debian_tar_url = self.fetch_debian_package_urls(self.buildinfo.source, self.buildinfo.version)
+            # dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.dsc"
+            # orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.40.1.orig.tar.gz"
+            # debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.debian.tar.xz"
 
             if not dsc_url or not orig_tar_url or not debian_tar_url:
                 # Prompt the user to provide source URLs for fallback
@@ -1342,7 +1336,7 @@ APT::Authentication::TrustCDROM "true";
                 '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(
                     " && ".join([
                         "cd /build/src_dir",
-                        "env {} dpkg-buildpackage -uc -a {} --build={}".format(env_vars, host_arch, build)
+                        "env {} dpkg-buildpackage -uc -d -a {} --build={}".format(env_vars, host_arch, build)
                     ])
                 ),
                 '--customize-hook=chroot "$1" sh -c "find /build -mindepth 1 -maxdepth 1 ! -name src_dir -exec mv {} /build/src_dir/ \\;"'
@@ -1419,6 +1413,8 @@ APT::Authentication::TrustCDROM "true";
             package_url = f"{base_url}{package_name[:4]}/{package_name}/"
         else:
             package_url = f"{base_url}{package_name[0]}/{package_name}/"
+
+        print(f"fetch_debian_package_urls has {package_url}")
 
         try:
             response = requests.get(package_url)
