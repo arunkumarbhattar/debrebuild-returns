@@ -94,7 +94,7 @@ def verify_checksums(self, output, new_buildinfo):
     status = True
     summary = {}
     changed_packages = set()
-    use_new_buildinfo = not self.is_source_available()
+    use_new_buildinfo = not is_source_available(self)
 
     logger.debug(f"Using new buildinfo: {use_new_buildinfo}")
 
