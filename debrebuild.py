@@ -20,32 +20,24 @@ import argparse
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
-
-import time
-import uuid
-from shlex import quote, join
-import shutil
-import requests
 import glob
-
-import apt
-import apt_pkg
 import debian.deb822
 import debian.debian_support
-import requests
-import rstr
-from bs4 import BeautifulSoup
 
-from lib.openpgp import OpenPGPEnvironment, OpenPGPException
-
+# Configure logging
 logger = logging.getLogger("debrebuild")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
 console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.DEBUG)  # Set handler level to DEBUG
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
+logger = logging.getLogger("execute_build")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
 
 
 class PackageException(Exception):

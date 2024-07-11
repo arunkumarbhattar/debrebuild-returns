@@ -568,11 +568,11 @@ class Rebuilder:
                     # Update the APT cache after adding each month's sources
                     try:
                         self.tempaptcache.close()  # Ensure cache is closed before updating
-                        print(f"try_snapshot_sources::APT cache closed successfully for {year}-{month}.")
+                        logger.debug(f"try_snapshot_sources::APT cache closed successfully for {year}-{month}.")
                         self.tempaptcache.update(sources_list=temp_sources_list)
-                        print(f"try_snapshot_sources::APT cache update called for {year}-{month}.")
+                        logger.debug(f"try_snapshot_sources::APT cache update called for {year}-{month}.")
                         self.tempaptcache.open()  # Reopen cache after update
-                        print(f"try_snapshot_sources::APT cache reopened successfully for {year}-{month}.")
+                        logger.debug(f"try_snapshot_sources::APT cache reopened successfully for {year}-{month}.")
                     except Exception as e:
                         logging.error(f"Error updating APT cache for {year}-{month}: {e}")
                         raise  # Re-raise the exception to handle it at a higher level or to halt the program
@@ -580,7 +580,7 @@ class Rebuilder:
                     # Attempt to find the package in the updated cache
                     pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
                     if pkg and notfound_pkg.version in pkg.versions.keys():
-                        print(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
+                        logger.debug(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
                         return True  # Package found, return True and the current year
 
                     # If package is not found, close the cache and revert the sources list
@@ -593,7 +593,7 @@ class Rebuilder:
                         fd.truncate()
                         fd.flush()
                         self.newly_added_sources = self.newly_added_sources[:-len(snapshot_sources)]
-                    print(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
+                    logger.debug(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
 
         return False  # Return False and the decremented year
 
@@ -609,10 +609,10 @@ class Rebuilder:
             # Extract timestamps and limit the number to 5
             timestamps = [link['href'].strip('/') for link in links if 'T' in link['href']][:3]
             if timestamps:
-                print(f"Available timestamps for {year}-{month} (limited to 6 or fewer): {timestamps}")
+                logger.debug(f"Available timestamps for {year}-{month} (limited to 6 or fewer): {timestamps}")
                 return timestamps
             else:
-                print(f"No timestamps found for {year}-{month}")
+                logger.debug(f"No timestamps found for {year}-{month}")
                 return []
         else:
             logging.error(f"Failed to retrieve data from snapshot.debian.org with status code: {response.status_code}")
@@ -643,7 +643,7 @@ class Rebuilder:
                 # Construct the source entries
                 deb_entry = f"deb {base_url}/{timestamp}/ {distribution} {component}"
                 deb_src_entry = f"deb-src {base_url}/{timestamp}/ {distribution} {component}"
-                #print("deb_entry:", deb_entry)
+                #logger.debug("deb_entry:", deb_entry)
 
                 release_url = f"{base_url}/{timestamp}/dists/{distribution}/Release"
                 all_entries.extend([deb_entry, deb_src_entry])

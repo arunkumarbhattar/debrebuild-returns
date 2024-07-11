@@ -16,12 +16,19 @@ from initialize_and_find_dependencies import Rebuilder, RebuilderBuildInfo, Pack
 
 import logging
 import sys
-logger = logging.getLogger("debrebuild")
+# Configure logging
+logger = logging.getLogger("execute_build")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
 console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.DEBUG)  # Set handler level to DEBUG
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-
 logger = logging.getLogger("execute_build")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
+
+
 DEBIAN_KEYRINGS = [
     "/usr/share/keyrings/debian-archive-bullseye-automatic.gpg",
     "/usr/share/keyrings/debian-archive-bullseye-security-automatic.gpg",
@@ -350,7 +357,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         logging.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
 
     if rebuilder.consider_local_repo:
-        print("DEBBIE")
+        logger.debug("DEBBIE")
         # Ensure the local repository directory exists
         local_repo_dir = "/tmp/local_repo"
         packages_file_src = os.path.join(local_repo_dir, "Packages")
@@ -414,7 +421,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         logging.debug("Added local repository setup to mmdebstrap command")
 
     else:
-        print("Not DEBBIE")
+        logger.debug("Not DEBBIE")
         # Update APT cache with provided sources.list
         cmd += [
             '--essential-hook=chroot "$1" sh -c "{}"'.format(
@@ -482,9 +489,9 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             rebuilder.fallback_orig_tar_url = orig_tar_url
             rebuilder.fallback_debian_tar_url = debian_tar_url
 
-            print(f"DSC URL: {rebuilder.fallback_dsc_url}")
-            print(f"Original Tar URL: {rebuilder.fallback_orig_tar_url}")
-            print(f"Debian Tar URL: {rebuilder.fallback_debian_tar_url}")
+            logger.debug(f"DSC URL: {rebuilder.fallback_dsc_url}")
+            logger.debug(f"Original Tar URL: {rebuilder.fallback_orig_tar_url}")
+            logger.debug(f"Debian Tar URL: {rebuilder.fallback_debian_tar_url}")
 
         cmd += [
             '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
@@ -613,7 +620,7 @@ def fetch_debian_package_urls(self, package_name, version):
     else:
         package_url = f"{base_url}{package_name[0]}/{package_name}/"
 
-    print(f"fetch_debian_package_urls has {package_url}")
+    logger.debug(f"fetch_debian_package_urls has {package_url}")
 
     try:
         response = requests.get(package_url)
@@ -744,7 +751,7 @@ def main():
     import sys
 
     if len(sys.argv) != 3:
-        print("Usage: python execute_build.py <rebuilder_json_file> <output_directory>")
+        logger.debug("Usage: python execute_build.py <rebuilder_json_file> <output_directory>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]

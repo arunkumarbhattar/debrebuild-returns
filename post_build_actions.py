@@ -9,12 +9,17 @@ from lib.downloads import download_with_retry
 from initialize_and_find_dependencies import Rebuilder, RebuilderBuildInfo
 import logging
 import sys
-logger = logging.getLogger("debrebuild")
-console_handler = logging.StreamHandler(sys.stderr)
-logger.addHandler(console_handler)
-
 
 logger = logging.getLogger("post_build_actions")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
+console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.DEBUG)  # Set handler level to DEBUG
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+logger = logging.getLogger("execute_build")
+logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
 
 class PackageException(Exception):
     pass
@@ -238,7 +243,7 @@ def main():
     import sys
 
     if len(sys.argv) != 3:
-        print("Usage: python post_build_actions.py <rebuilder_json_file> <output_directory>")
+        logger.debug("Usage: python post_build_actions.py <rebuilder_json_file> <output_directory>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
