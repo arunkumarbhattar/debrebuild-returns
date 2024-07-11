@@ -313,6 +313,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         '--aptopt=Acquire::http::Dl-Limit "1000";',
         '--aptopt=Acquire::https::Dl-Limit "1000";',
         '--aptopt=Acquire::Retries "5";',
+        '--aptopt=APT::Get::allow-downgrades "true";',
     ]
 
     logging.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
@@ -424,11 +425,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             '--essential-hook=ls /tmp/local_repo',  # Verify the contents of the source directory
             '--essential-hook=cp -r /tmp/local_repo/* "$1"/mnt/local_repo/',
             '--essential-hook=ls "$1"/mnt/local_repo',  # Verify the contents of the target directory after copying
-            '--essential-hook=chroot "$1" sh -c "echo \'deb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',
-            # Append the new entry
-            '--essential-hook=chroot "$1" sh -c "apt-get update"',
-            '--essential-hook=chroot "$1" sh -c "apt-get install dpkg-dev -y"',
-            # Install dpkg-dev if not already installed
+            '--essential-hook=chroot "$1" sh -c "echo \'\ndeb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',
             '--essential-hook=chroot "$1" sh -c "cd /mnt/local_repo && dpkg-scanpackages . | gzip -c > Packages.gz"',
             # Generate Packages.gz
             '--essential-hook=chroot "$1" sh -c "apt-get update"',  # Update apt after generating Packages.gz

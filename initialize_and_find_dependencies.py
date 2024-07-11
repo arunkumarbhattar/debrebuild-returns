@@ -477,7 +477,6 @@ class Rebuilder:
         if local_repo_entry not in lines:
             with open(temp_sources_list, "a") as fd:
                 fd.write(local_repo_entry)
-                self.newly_added_sources.append(local_repo_entry.strip())
 
         # Remove duplicate entries from the sources list
         seen = set()
@@ -640,8 +639,6 @@ class Rebuilder:
         if local_repo_entry not in lines:
             with open(temp_sources_list, "a") as fd:
                 fd.write(f"{local_repo_entry}\n")
-                self.newly_added_sources.append(local_repo_entry)
-
         # Remove duplicate entries from the sources list
         seen = set()
         unique_lines = []
@@ -677,7 +674,6 @@ class Rebuilder:
                     fd.seek(0)
                     fd.writelines([line for line in lines if line.strip() != local_repo_entry])
                     fd.truncate()
-                self.newly_added_sources.remove(local_repo_entry)
                 return True  # Package found, return True
         except Exception as e:
             logging.error(f"Error checking APT cache for package: {e}")
@@ -688,7 +684,6 @@ class Rebuilder:
             fd.seek(0)
             fd.writelines([line for line in lines if line.strip() != local_repo_entry])
             fd.truncate()
-            self.newly_added_sources.remove(local_repo_entry)
         logging.debug(
             f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found. Reverting changes.")
 
