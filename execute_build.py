@@ -402,6 +402,22 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             logging.error(f"Failed to update the Filename paths in the Packages file: {e}")
             return False
 
+        cmd += [
+            '--essential-hook=chroot "$1" sh -c "{}"'.format(
+                " && ".join(
+                    [
+                        "rm /etc/apt/sources.list",
+                        "echo '{}' >> /etc/apt/sources.list".format(
+                            "\n".join(
+                                get_sources_list(rebuilder)
+                                + get_sources_list_timestamps(rebuilder)
+                            )
+                        ),
+                    ]
+                )
+            )
+        ]
+
         # Ensure the directory exists inside the chroot before copying the local repository
         cmd += [
             '--essential-hook=chroot "$1" mkdir -p /mnt/local_repo',

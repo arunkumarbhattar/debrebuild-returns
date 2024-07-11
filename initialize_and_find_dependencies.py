@@ -466,23 +466,23 @@ class Rebuilder:
             logging.error(f"Packages file {packages_file}.gz does not exist.")
             return False
 
-        local_repo_entry = f"deb [trusted=yes] file://{local_repo_dir} ./"
+        local_repo_entry = f"\ndeb [trusted=yes] file://{local_repo_dir} ./\n"
         temp_sources_list = os.path.join(self.tempaptdir, "etc/apt/sources.list")
 
-        # Reading the sources list file
+        # Read the sources list file
         with open(temp_sources_list, "r") as fd:
             lines = fd.readlines()
 
-        # Add the local repo entry if not already present
+        # Add the local repo entry if not already present and ensure it is added only once
         if local_repo_entry not in lines:
             with open(temp_sources_list, "a") as fd:
-                fd.write(f"{local_repo_entry}\n")
-                self.newly_added_sources.append(local_repo_entry)
+                fd.write(local_repo_entry)
+                self.newly_added_sources.append(local_repo_entry.strip())
 
         # Remove duplicate entries from the sources list
         seen = set()
         unique_lines = []
-        for line in lines + [local_repo_entry + '\n']:
+        for line in lines + [local_repo_entry]:
             if line not in seen:
                 unique_lines.append(line)
                 seen.add(line)
@@ -493,18 +493,60 @@ class Rebuilder:
 
         # Update the APT cache
         try:
-            self.tempaptcache.close()  # Ensure cache is closed before updating
+            self.tempaptcache.close()
             logging.debug("APT cache closed successfully.")
             self.tempaptcache.update(sources_list=temp_sources_list)
             logging.debug("APT cache update called.")
-            self.tempaptcache.open()  # Reopen cache after update
+            self.tempaptcache.open()
             logging.debug("APT cache reopened successfully.")
         except Exception as e:
             logging.error(f"Error updating APT cache: {e}")
             return False
 
+        if not self.check_and_resolve_dependencies():
+            logging.error("Not all dependencies are satisfied.")
+            return False
+
+        # Remove the local repository entry from sources.list
+        with open(temp_sources_list, "r") as fd:
+            lines = fd.readlines()
+
+        with open(temp_sources_list, "w") as fd:
+            fd.writelines([line for line in lines if line.strip() != local_repo_entry.strip()])
+
+        try:
+            self.tempaptcache.close()
+            logging.debug("APT cache closed successfully.")
+            self.tempaptcache.update(sources_list=temp_sources_list)
+            logging.debug("APT cache updated after removing local repo entry.")
+            self.tempaptcache.open()
+            logging.debug("APT cache reopened successfully.")
+        except Exception as e:
+            logging.error(f"Error updating APT cache after removing local repo entry: {e}")
+            return False
+
         logging.debug(f"Local repository setup completed successfully.")
         return True
+
+    def check_and_resolve_dependencies(self):
+        try:
+            # Check for missing dependencies
+            result = subprocess.run(
+                ["apt-get", "check", "-o", f"Dir::Etc::sourcelist={self.tempaptdir}/etc/apt/sources.list"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False
+            )
+            missing_deps = result.stderr.decode()
+            if "unmet dependencies" in missing_deps:
+                logging.error(f"Unmet dependencies found: {missing_deps}")
+                return False
+            else:
+                logging.debug("All dependencies are satisfied.")
+                return True
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Error checking dependencies: {e}")
+            return False
 
     def try_direct_through_deb(self, notfound_pkg):
         package_name_version = notfound_pkg.to_apt_install_format()
