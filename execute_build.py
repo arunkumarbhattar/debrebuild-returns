@@ -356,7 +356,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         ]
         logging.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
 
-    if rebuilder.consider_local_repo:
+    if rebuilder.consider_local_repo or rebuilder.custom_deb:
         logger.debug("DEBBIE")
         # Ensure the local repository directory exists
         local_repo_dir = "/tmp/local_repo"

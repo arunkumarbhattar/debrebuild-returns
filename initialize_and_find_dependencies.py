@@ -19,14 +19,13 @@ import debian.deb822
 from dateutil.parser import parse as parsedate
 from rstr import rstr
 
-
 from lib.openpgp import OpenPGPException, OpenPGPEnvironment
 import logging
 import sys
+
 logger = logging.getLogger("debrebuild")
 console_handler = logging.StreamHandler(sys.stderr)
 logger.addHandler(console_handler)
-
 
 logger = logging.getLogger("initialize_and_find_dependencies")
 
@@ -47,11 +46,14 @@ DEBIAN_KEYRINGS = [
     "/usr/share/keyrings/debian-keyring.gpg",
 ]
 
+
 class BuildInfoException(Exception):
     pass
 
+
 class RebuilderException(Exception):
     pass
+
 
 class Package:
     def __init__(
@@ -96,8 +98,10 @@ class Package:
             "component_name": self.component_name,
             "hash": self.hash,
         }
+
     def __repr__(self):
         return f"Package({self.name}, {self.version}, architecture={self.architecture})"
+
 
 class PackageNotFoundException(Exception):
     def __init__(self, package_name):
@@ -241,7 +245,12 @@ class RebuilderBuildInfo:
 
 
 class Rebuilder:
-    def __init__(self, builder_json_file, buildinfo_file, snapshot_url, snapshot_mirror, extra_repository_files=None, extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None, use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False, custom_package=None):
+    def __init__(self, custom_deb, builder_json_file, buildinfo_file, snapshot_url, snapshot_mirror,
+                 extra_repository_files=None,
+                 extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None,
+                 use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False,
+                 custom_package=None):
+        self.custom_deb = custom_deb
         self.rebuilder_buildinfo_metadata_path = None
         self.builder_json_file = builder_json_file
         self.buildinfo_pickle_file = ""
@@ -330,7 +339,8 @@ class Rebuilder:
             "checkpoint_dir": self.checkpoint_dir,
             "checkpoint_files": self.checkpoint_files,
             "rebuilder_buildinfo_metadata_path": self.rebuilder_buildinfo_metadata_path,
-            "buildinfo_pickle_file": self.buildinfo_pickle_file
+            "buildinfo_pickle_file": self.buildinfo_pickle_file,
+            "custom_deb": self.custom_deb
         }
 
     @staticmethod
@@ -377,6 +387,7 @@ class Rebuilder:
         instance.rebuilder_buildinfo_metadata_path = data["rebuilder_buildinfo_metadata_path"]
         instance.buildinfo_pickle_file = data["buildinfo_pickle_file"]
         instance.buildinfo = RebuilderBuildInfo.from_pickle_file(instance.buildinfo_pickle_file)
+        instance.custom_deb = data["custom_deb"]
         return instance
 
     def to_json_file(self, filepath):
@@ -402,6 +413,97 @@ class Rebuilder:
             self.custom_package_dir = os.path.dirname(self.custom_package)
         else:
             raise RebuilderException(f"Unsupported custom package format: {self.custom_package}")
+
+    def setup_local_repository(self):
+        local_repo_dir = "/tmp/local_repo"
+        os.makedirs(local_repo_dir, exist_ok=True)
+
+        # Copy user-provided .deb files to the local repository directory
+        for deb_path in self.custom_deb:
+            if os.path.isfile(deb_path):
+                shutil.copy(deb_path, local_repo_dir)
+                logging.debug(f"Copied user-provided .deb file to {local_repo_dir}")
+            else:
+                logging.error(f"User-provided .deb file does not exist: {deb_path}")
+
+        packages_file = os.path.join(local_repo_dir, "Packages")
+        temp_packages_file = os.path.join(local_repo_dir, "Packages.temp")
+
+        # Generate entries for the new .deb files
+        try:
+            with open(temp_packages_file, "w") as f:
+                subprocess.run(["dpkg-scanpackages", local_repo_dir, "/dev/null"], stdout=f, check=True)
+                logging.debug(f"Generated temp Packages file at {temp_packages_file}")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to generate the temp Packages file: {e}")
+            return False
+
+        # Ensure the Packages file exists and is properly updated
+        try:
+            if os.path.exists(packages_file):
+                with open(packages_file, "a") as f:
+                    with open(temp_packages_file, "r") as temp_f:
+                        f.write(temp_f.read())
+                os.remove(temp_packages_file)
+            else:
+                os.rename(temp_packages_file, packages_file)
+            logging.debug(f"Updated Packages file at {packages_file}")
+        except Exception as e:
+            logging.error(f"Failed to update the Packages file: {e}")
+            return False
+
+        # Compress the Packages file and overwrite if it exists
+        try:
+            subprocess.run(["gzip", "-kf", packages_file], check=True)
+            logging.debug(f"Compressed Packages file to {packages_file}.gz")
+        except subprocess.CalledProcessError as e:
+            logging.error(f"Failed to compress the Packages file: {e}")
+            return False
+
+        # Verify the Packages.gz file exists
+        if not os.path.exists(packages_file + ".gz"):
+            logging.error(f"Packages file {packages_file}.gz does not exist.")
+            return False
+
+        local_repo_entry = f"deb [trusted=yes] file://{local_repo_dir} ./"
+        temp_sources_list = os.path.join(self.tempaptdir, "etc/apt/sources.list")
+
+        # Reading the sources list file
+        with open(temp_sources_list, "r") as fd:
+            lines = fd.readlines()
+
+        # Add the local repo entry if not already present
+        if local_repo_entry not in lines:
+            with open(temp_sources_list, "a") as fd:
+                fd.write(f"{local_repo_entry}\n")
+                self.newly_added_sources.append(local_repo_entry)
+
+        # Remove duplicate entries from the sources list
+        seen = set()
+        unique_lines = []
+        for line in lines + [local_repo_entry + '\n']:
+            if line not in seen:
+                unique_lines.append(line)
+                seen.add(line)
+
+        # Write back the unique lines
+        with open(temp_sources_list, "w") as fd:
+            fd.writelines(unique_lines)
+
+        # Update the APT cache
+        try:
+            self.tempaptcache.close()  # Ensure cache is closed before updating
+            logging.debug("APT cache closed successfully.")
+            self.tempaptcache.update(sources_list=temp_sources_list)
+            logging.debug("APT cache update called.")
+            self.tempaptcache.open()  # Reopen cache after update
+            logging.debug("APT cache reopened successfully.")
+        except Exception as e:
+            logging.error(f"Error updating APT cache: {e}")
+            return False
+
+        logging.debug(f"Local repository setup completed successfully.")
+        return True
 
     def try_direct_through_deb(self, notfound_pkg):
         package_name_version = notfound_pkg.to_apt_install_format()
@@ -544,10 +646,10 @@ class Rebuilder:
             fd.writelines([line for line in lines if line.strip() != local_repo_entry])
             fd.truncate()
             self.newly_added_sources.remove(local_repo_entry)
-        logging.debug(f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found. Reverting changes.")
+        logging.debug(
+            f"try_direct_through_deb::Package {notfound_pkg.to_apt_install_format()} not found. Reverting changes.")
 
         return True
-
 
     def try_snapshot_sources(self, notfound_pkg):
         # Dynamically generate snapshot source links, add to sources list, check, and clean up if not found
@@ -580,7 +682,8 @@ class Rebuilder:
                     # Attempt to find the package in the updated cache
                     pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
                     if pkg and notfound_pkg.version in pkg.versions.keys():
-                        logger.debug(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
+                        logger.debug(
+                            f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
                         return True  # Package found, return True and the current year
 
                     # If package is not found, close the cache and revert the sources list
@@ -593,10 +696,10 @@ class Rebuilder:
                         fd.truncate()
                         fd.flush()
                         self.newly_added_sources = self.newly_added_sources[:-len(snapshot_sources)]
-                    logger.debug(f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
+                    logger.debug(
+                        f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
 
         return False  # Return False and the decremented year
-
 
     def fetch_all_available_timestamps(self, year, month):
         # Construct URL to fetch the page that lists all snapshots for a given month and year
@@ -662,8 +765,8 @@ def add_checkpoint_file(self, file_path, description):
         "description": description
     })
 
-def initialize_and_find_dependencies(rebuilder):
 
+def initialize_and_find_dependencies(rebuilder):
     logger.debug("Starting the initialization and dependency finding process")
 
     # Determine build architecture
@@ -686,7 +789,8 @@ def initialize_and_find_dependencies(rebuilder):
     for key in DEBIAN_KEYRINGS:
         if not os.path.exists(key):
             logger.error(f"Keyring not found: {key}")
-            raise RebuilderException(f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring, and debian-ports-archive-keyring.")
+            raise RebuilderException(
+                f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring, and debian-ports-archive-keyring.")
     logger.debug("Keyring pre-checks completed successfully.")
 
     # Initialize and find build dependencies
@@ -724,7 +828,8 @@ def initialize_and_find_dependencies(rebuilder):
     # Save the updated state
     if not rebuilder.builder_json_file:
         new_json_file = os.path.join(rebuilder.checkpoint_dir, f"checkpoint_find_dep_{rebuilder.buildinfo.source}.json")
-        new_buildinfo_pickle_file = os.path.join(rebuilder.checkpoint_dir, f"checkpoint_find_dep_{rebuilder.buildinfo.source}.pkl")
+        new_buildinfo_pickle_file = os.path.join(rebuilder.checkpoint_dir,
+                                                 f"checkpoint_find_dep_{rebuilder.buildinfo.source}.pkl")
         rebuilder.buildinfo_pickle_file = new_buildinfo_pickle_file
         rebuilder.builder_json_file = new_json_file
         rebuilder.to_json_file(new_json_file)
@@ -793,12 +898,14 @@ def find_build_dependencies(rebuilder):
                     if pkg is not None and pkg.versions.get(notfound_pkg.version) is not None:
                         notfound_packages.remove(notfound_pkg)
 
+                rebuilder.setup_local_repository()
                 rebuilder.tempaptcache.close()
 
     if notfound_packages:
         for notfound_pkg in notfound_packages:
             logger.debug(f"{notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}")
         raise RebuilderException("Cannot locate the following packages via snapshots or the current repo/mirror")
+
 
 def prepare_aptcache(rebuilder):
     # create a temporary directory where all APT configuration files will be stored
@@ -865,6 +972,7 @@ def prepare_aptcache(rebuilder):
     except (PermissionError, apt_pkg.Error) as e:
         logger.error(f"Error initializing APT cache: {e}")
         raise RebuilderException("Failed to initialize APT cache")
+
 
 def find_build_dependencies_from_metasnap(rebuilder):
     status = False
@@ -939,6 +1047,7 @@ def get_response(self, url):
         resp.reason = str(e)
     return resp
 
+
 # TODO: refactor get_src_date and get_bin_date. Do a better distinction between "BuildInfo"
 #  and the source package which as to be defined.
 def get_src_date(self):
@@ -1002,6 +1111,7 @@ def get_src_date(self):
         self.buildinfo.component_name,
     )
 
+
 def get_bin_date(self, package):
     pkgname = package.name
     pkgver = package.version
@@ -1019,7 +1129,8 @@ def get_bin_date(self, package):
             data = resp.json()
             break  # Exit the loop if parsing is successful
         except json.decoder.JSONDecodeError:
-            logger.warning(f"Attempt {attempt + 1}: Cannot parse response for package: {pkgname}. Retrying in 3 seconds...")
+            logger.warning(
+                f"Attempt {attempt + 1}: Cannot parse response for package: {pkgname}. Retrying in 3 seconds...")
             time.sleep(3)
 
     if data is None:
@@ -1077,6 +1188,7 @@ def get_bin_date(self, package):
         package.component_name,
     )
 
+
 def get_sources_list(self):
     sources_list = self.newly_added_sources
     archive_name, source_date, dist, component = get_src_date(self)
@@ -1108,6 +1220,7 @@ def get_sources_list(self):
 
     return sources_list
 
+
 def get_sources_list_timestamps(self):
     """
     Returns all timestamp inline Debian repositories for all archives
@@ -1116,6 +1229,7 @@ def get_sources_list_timestamps(self):
     for sources in self.required_timestamp_sources.values():
         sources_list += sources
     return sources_list
+
 
 def get_build_depends_timestamps(self):
     """
@@ -1147,6 +1261,7 @@ def get_build_depends_timestamps(self):
         location_required_timestamps[location] = timestamps
     return location_required_timestamps
 
+
 def get_sources_list_from_timestamp(self):
     """
     Returns a dict with keys archive+suite+component and
@@ -1165,6 +1280,7 @@ def get_sources_list_from_timestamp(self):
             )
     return sources_list
 
+
 if __name__ == "__main__":
     builder_json_file = sys.argv[1]
 
@@ -1174,6 +1290,7 @@ if __name__ == "__main__":
 
     # Create the Rebuilder instance using the arguments dictionary
     rebuilder = Rebuilder(
+        custom_deb=builder_args["custom_deb"],
         builder_json_file=builder_args["builder_json_file"],
         buildinfo_file=builder_args["buildinfo_file"],
         snapshot_url=builder_args["snapshot_url"],

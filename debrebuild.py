@@ -159,7 +159,7 @@ def get_args():
     )
     parser.add_argument(
         "--builder_json_file",
-        help="builde process to resume from",
+        help="Build process to resume from",
         default="",
     )
     parser.add_argument(
@@ -194,8 +194,9 @@ def get_args():
         "--debug", action="store_true", help="Display logger debug messages."
     )
     parser.add_argument(
-        "--custom-package",
-        help="Path to a custom package (source or binary) to use in the build",
+        "--custom-deb",
+        help="List of paths to custom .deb files to include in the build",
+        action="append",
     )
     return parser.parse_args()
 
@@ -254,7 +255,8 @@ def main():
             "metasnap_url": args.metasnap_url,
             "build_options_nocheck": args.build_options_nocheck,
             "builder_json_file": args.builder_json_file,
-            "output_dir": args.output
+            "output_dir": args.output,
+            "custom_deb": args.custom_deb,
         }
 
         run(rebuilder_args)
