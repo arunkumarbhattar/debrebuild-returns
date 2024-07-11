@@ -207,6 +207,17 @@ def generate_diffoscope(rebuilder, output, summary):
                 run_diffoscope(output, debian_file, f)
             except Exception as e:
                 logger.error(f"Cannot generate diffoscope for {f}: {str(e)}")
+def is_source_available(self):
+    # Implement the logic to check if the source package and version are available
+    source_check_cmd = [
+        "apt-get",
+        "source",
+        "--only-source",
+        "-d",
+        "{}={}".format(self.buildinfo.source, self.buildinfo.source_version)
+    ]
+    result = subprocess.run(source_check_cmd, capture_output=True, text=True)
+    return result.returncode == 0
 
 def post_build_actions(rebuilder, output):
     # Post-build actions
@@ -219,7 +230,8 @@ def post_build_actions(rebuilder, output):
     new_buildinfo_file = max(buildinfo_files, key=os.path.getmtime)
     logger.debug(f"Using buildinfo file: {new_buildinfo_file}")
 
-    if rebuilder.is_source_available():
+    if is_source_available(rebuilder
+                           ):
         new_buildinfo = RebuilderBuildInfo(new_buildinfo_file, False)
     else:
         new_buildinfo = RebuilderBuildInfo(new_buildinfo_file, True)

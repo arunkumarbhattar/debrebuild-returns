@@ -359,6 +359,7 @@ class Rebuilder:
     def from_dict(cls, data, filepath):
         """Deserialize a Rebuilder object from a dictionary."""
         instance = cls(
+            custom_deb=data["custom_deb"],
             builder_json_file=filepath,
             buildinfo_file=data["buildinfo_file"],
             snapshot_url=data["snapshot_url"],
@@ -898,7 +899,8 @@ def find_build_dependencies(rebuilder):
                     if pkg is not None and pkg.versions.get(notfound_pkg.version) is not None:
                         notfound_packages.remove(notfound_pkg)
 
-                rebuilder.setup_local_repository()
+                if rebuilder.custom_deb:
+                    rebuilder.setup_local_repository()
                 rebuilder.tempaptcache.close()
 
     if notfound_packages:
