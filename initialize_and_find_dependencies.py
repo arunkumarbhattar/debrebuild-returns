@@ -8,12 +8,13 @@ import subprocess
 import sys
 import tempfile
 import time
+
+import apt
 import debian.debian_support
 
 import requests
-import apt
 import apt_pkg
-from apport.crashdb_impl import debian
+
 from bs4 import BeautifulSoup
 import debian.deb822
 from dateutil.parser import parse as parsedate
@@ -23,11 +24,14 @@ from lib.openpgp import OpenPGPException, OpenPGPEnvironment
 import logging
 import sys
 
-logger = logging.getLogger("debrebuild")
-console_handler = logging.StreamHandler(sys.stderr)
-logger.addHandler(console_handler)
-
+# Configure logging
 logger = logging.getLogger("initialize_and_find_dependencies")
+logger.setLevel(logging.DEBUG)
+console_handler = logging.StreamHandler(sys.stderr)
+console_handler.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
 
 DEBIAN_KEYRINGS = [
     "/usr/share/keyrings/debian-archive-bullseye-automatic.gpg",
@@ -689,113 +693,6 @@ class Rebuilder:
 
         return True
 
-    def try_snapshot_sources(self, notfound_pkg):
-        # Dynamically generate snapshot source links, add to sources list, check, and clean up if not found
-        years = range(2024, 2018, -1)  # Example range, adjust as needed
-        for year in years:
-            temp_sources_list = self.tempaptdir + "/etc/apt/sources.list"
-            logging.debug(f"try_snapshot_sources::temp_sources_list is {temp_sources_list}.")
-
-            for month in range(1, 13, 3):  # Iterate over all every 3 months
-                snapshot_sources = self.find_packages_in_snapshots(year, month)
-                if snapshot_sources:
-                    with open(temp_sources_list, "a") as fd:
-                        for source in snapshot_sources:
-                            fd.write(f"{source}\n")  # Write each source with a newline
-                            fd.flush()
-                            self.newly_added_sources.append(source)
-
-                    # Update the APT cache after adding each month's sources
-                    try:
-                        self.tempaptcache.close()  # Ensure cache is closed before updating
-                        logger.debug(f"try_snapshot_sources::APT cache closed successfully for {year}-{month}.")
-                        self.tempaptcache.update(sources_list=temp_sources_list)
-                        logger.debug(f"try_snapshot_sources::APT cache update called for {year}-{month}.")
-                        self.tempaptcache.open()  # Reopen cache after update
-                        logger.debug(f"try_snapshot_sources::APT cache reopened successfully for {year}-{month}.")
-                    except Exception as e:
-                        logging.error(f"Error updating APT cache for {year}-{month}: {e}")
-                        raise  # Re-raise the exception to handle it at a higher level or to halt the program
-
-                    # Attempt to find the package in the updated cache
-                    pkg = self.tempaptcache.get(f"{notfound_pkg.name}:{notfound_pkg.architecture}")
-                    if pkg and notfound_pkg.version in pkg.versions.keys():
-                        logger.debug(
-                            f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} found in APT cache for {year}-{month}.")
-                        return True  # Package found, return True and the current year
-
-                    # If package is not found, close the cache and revert the sources list
-                    self.tempaptcache.close()
-                    with open(temp_sources_list, "r+") as fd:
-                        lines = fd.readlines()
-                        fd.seek(0)
-                        # Remove the entries added for this month only
-                        fd.writelines(lines[:-len(snapshot_sources)])
-                        fd.truncate()
-                        fd.flush()
-                        self.newly_added_sources = self.newly_added_sources[:-len(snapshot_sources)]
-                    logger.debug(
-                        f"try_snapshot_sources::Package {notfound_pkg.to_apt_install_format()} not found for {year}-{month}. Reverting changes.")
-
-        return False  # Return False and the decremented year
-
-    def fetch_all_available_timestamps(self, year, month):
-        # Construct URL to fetch the page that lists all snapshots for a given month and year
-        url = f"https://snapshot.debian.org/archive/debian/?year={year}&month={month}"
-        response = requests.get(url)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            # Find all <a> tags which might contain the timestamps
-            links = soup.find_all('a', href=True)  # Find all <a> tags with href attributes
-            # Extract timestamps and limit the number to 5
-            timestamps = [link['href'].strip('/') for link in links if 'T' in link['href']][:3]
-            if timestamps:
-                logger.debug(f"Available timestamps for {year}-{month} (limited to 6 or fewer): {timestamps}")
-                return timestamps
-            else:
-                logger.debug(f"No timestamps found for {year}-{month}")
-                return []
-        else:
-            logging.error(f"Failed to retrieve data from snapshot.debian.org with status code: {response.status_code}")
-            return []
-
-    def check_release_file_exists(self, url):
-        try:
-            response = requests.head(url)
-            return response.status_code == 200
-        except requests.RequestException as e:
-            logging.error(f"Request failed: {e}")
-            return False
-
-    def find_packages_in_snapshots(self, year, month):
-        if year == 2024 and month >= 7:
-            return []
-        timestamps = self.fetch_all_available_timestamps(year, month)
-        all_entries = []
-        if timestamps:
-            base_url = "http://snapshot.debian.org/archive/debian"
-
-            # Distribution and components are typical for Debian repositories
-            distribution = "sid"
-            component = "main"
-
-            for timestamp in timestamps:
-                timestamp = timestamp.strip('/')  # Clean up timestamp
-                # Construct the source entries
-                deb_entry = f"deb {base_url}/{timestamp}/ {distribution} {component}"
-                deb_src_entry = f"deb-src {base_url}/{timestamp}/ {distribution} {component}"
-                #logger.debug("deb_entry:", deb_entry)
-
-                release_url = f"{base_url}/{timestamp}/dists/{distribution}/Release"
-                all_entries.extend([deb_entry, deb_src_entry])
-
-                logging.info("Constructed package source entries for all timestamps.")
-                return all_entries
-        else:
-            logging.error(f"Unable to find any snapshots for {year}-{month}")
-            return []
-
-
 def add_checkpoint_file(self, file_path, description):
     relative_path = os.path.relpath(file_path, self.checkpoint_dir)
     self.checkpoint_files.append({
@@ -803,26 +700,29 @@ def add_checkpoint_file(self, file_path, description):
         "description": description
     })
 
+def bootstrap_build_base_system(rebuilder):
+    logger.debug("Starting the bootstrap build base system process")
 
-def initialize_and_find_dependencies(rebuilder):
-    logger.debug("Starting the initialization and dependency finding process")
+    # Step 1: Determine the build architecture
+    build_arch = determine_build_architecture(rebuilder)
 
-    # Determine build architecture
-    logger.debug("Determining build architecture...")
-    if rebuilder.buildinfo.architecture:
-        build_arch = rebuilder.get_host_architecture()
-        logger.debug(f"Determined build architecture from buildinfo: {build_arch}")
-    elif rebuilder.buildinfo.build_archall:
-        build_arch = "all"
-        logger.debug("Building for all architectures.")
-    elif rebuilder.buildinfo.build_source:
-        build_arch = "source"
-        logger.debug("Building from source.")
-    else:
-        logger.error("Failed to determine what to build.")
-        raise RebuilderException("Nothing to build")
+    # Step 2: Perform pre-checks for keyrings
+    pre_checks_for_keyrings()
 
-    # Perform pre-checks
+    # Step 3: Initialize and find build dependencies
+    try:
+        initialize_and_find_dependencies(rebuilder)
+    except (apt_pkg.Error, apt.cache.FetchFailedException, requests.exceptions.ConnectionError) as e:
+        logger.error(f"Failed to fetch packages: {str(e)}")
+        raise RebuilderException(f"Failed to fetch packages: {str(e)}")
+    except KeyboardInterrupt:
+        logger.error("Operation interrupted by user.")
+        raise RebuilderException("Interruption")
+
+    # Step 4: Clean up and create a checkpoint of the build state
+    cleanup_and_create_checkpoint(rebuilder)
+
+def pre_checks_for_keyrings():
     logger.debug("Performing pre-checks for keyrings...")
     for key in DEBIAN_KEYRINGS:
         if not os.path.exists(key):
@@ -831,23 +731,18 @@ def initialize_and_find_dependencies(rebuilder):
                 f"Cannot find {key}. Ensure to have installed debian-keyring, debian-archive-keyring, and debian-ports-archive-keyring.")
     logger.debug("Keyring pre-checks completed successfully.")
 
-    # Initialize and find build dependencies
-    logger.debug("Initializing and finding build dependencies...")
-    try:
-        if rebuilder.use_metasnap:
-            logger.debug("Using metasnap for getting required timestamps.")
-            find_build_dependencies_from_metasnap(rebuilder)
-        if not rebuilder.required_timestamp_sources:
-            logger.debug("Using standard snapshot method for getting required timestamps.")
-            find_build_dependencies(rebuilder)
-    except (apt_pkg.Error, apt.cache.FetchFailedException, requests.exceptions.ConnectionError) as e:
-        logger.error(f"Failed to fetch packages: {str(e)}")
-        raise RebuilderException(f"Failed to fetch packages: {str(e)}")
-    except KeyboardInterrupt:
-        logger.error("Operation interrupted by user.")
-        raise RebuilderException("Interruption")
 
-    # Clean up and create checkpoint
+def initialize_and_find_dependencies(rebuilder):
+    logger.debug("Initializing and finding build dependencies...")
+    if rebuilder.use_metasnap:
+        logger.debug("Using metasnap for getting required timestamps.")
+        find_build_dependencies_from_metasnap(rebuilder)
+    if not rebuilder.required_timestamp_sources:
+        logger.debug("Using standard snapshot method for getting required timestamps.")
+        find_build_dependencies(rebuilder)
+
+
+def cleanup_and_create_checkpoint(rebuilder):
     logger.debug("Cleaning up temporary directories...")
     if rebuilder.tempaptdir and rebuilder.tempaptdir.startswith(os.path.join(rebuilder.tmpdir, "debrebuild-")):
         if rebuilder.tempaptcache:
@@ -863,7 +758,6 @@ def initialize_and_find_dependencies(rebuilder):
         rebuilder.checkpoint_files = [os.path.relpath(os.path.join(root, file), checkpoint_dir)
                                       for root, _, files in os.walk(dest_dir) for file in files]
 
-    # Save the updated state
     if not rebuilder.builder_json_file:
         new_json_file = os.path.join(rebuilder.checkpoint_dir, f"checkpoint_find_dep_{rebuilder.buildinfo.source}.json")
         new_buildinfo_pickle_file = os.path.join(rebuilder.checkpoint_dir,
@@ -880,6 +774,21 @@ def initialize_and_find_dependencies(rebuilder):
         logger.debug(f"Rebuilder state saved to {rebuilder.builder_json_file}")
         logger.debug(f"Rebuilder Buildinfo state saved to {rebuilder.buildinfo_pickle_file}")
 
+def determine_build_architecture(rebuilder):
+    logger.debug("Determining build architecture...")
+    if rebuilder.buildinfo.architecture:
+        build_arch = rebuilder.get_host_architecture()
+        logger.debug(f"Determined build architecture from buildinfo: {build_arch}")
+    elif rebuilder.buildinfo.build_archall:
+        build_arch = "all"
+        logger.debug("Building for all architectures.")
+    elif rebuilder.buildinfo.build_source:
+        build_arch = "source"
+        logger.debug("Building from source.")
+    else:
+        logger.error("Failed to determine what to build.")
+        raise RebuilderException("Nothing to build")
+    return build_arch
 
 def find_build_dependencies(rebuilder):
     # Prepare APT cache for finding dependencies
@@ -1345,4 +1254,4 @@ if __name__ == "__main__":
         build_options_nocheck=builder_args["build_options_nocheck"]
     )
 
-    initialize_and_find_dependencies(rebuilder)
+    bootstrap_build_base_system(rebuilder)
