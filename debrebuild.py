@@ -19,6 +19,70 @@ formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(messag
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
+
+def setup_keyrings_in_docker():
+    # List of specific keyring files to copy
+    DEBIAN_KEYRINGS = [
+        "debian-archive-bullseye-automatic.gpg",
+        "debian-archive-bullseye-security-automatic.gpg",
+        "debian-archive-bullseye-stable.gpg",
+        "debian-archive-buster-automatic.gpg",
+        "debian-archive-buster-security-automatic.gpg",
+        "debian-archive-buster-stable.gpg",
+        "debian-archive-keyring.gpg",
+        "debian-archive-removed-keys.gpg",
+        "debian-archive-stretch-automatic.gpg",
+        "debian-archive-stretch-security-automatic.gpg",
+        "debian-archive-stretch-stable.gpg",
+        "debian-ports-archive-keyring-removed.gpg",
+        "debian-ports-archive-keyring.gpg",
+        "debian-keyring.gpg",
+    ]
+
+    # Directory name in the Docker container where keyrings will be stored
+    container_keyring_dir = "/app/keyrings"
+
+    # Command to create the keyrings directory inside the Docker container
+    create_directory_command = f"mkdir -p {container_keyring_dir}"
+
+    # Commands to copy each specific keyring file
+    copy_commands = " && ".join(
+        [f"cp /usr/share/keyrings/{keyring} {container_keyring_dir}/" for keyring in DEBIAN_KEYRINGS]
+    )
+
+    # Command to update APT sources.list to use these keyrings with the signed-by option
+    # Here you'd specify your actual Debian mirror and distribution details
+    setup_apt_sources_commands = " && ".join(
+        [f'echo "deb [signed-by={container_keyring_dir}/{keyring}] http://deb.debian.org/debian bullseye main" > /etc/apt/sources.list.d/{keyring}.list'
+         for keyring in DEBIAN_KEYRINGS]
+    )
+
+    # Full command to create directory, copy files, and update APT configuration
+    full_command = f"{create_directory_command} && {copy_commands} && {setup_apt_sources_commands}"
+
+    # Assemble the Docker command with the entire current directory mounted
+    current_directory = os.getcwd()
+    cmd = [
+        'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
+        '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
+        '-v', '/usr/share/keyrings:/usr/share/keyrings',  # Mount the host's keyrings directory
+        '-w', '/app',  # Set working directory to /app
+        '--entrypoint', '/bin/bash',
+        'debrebuild',
+        '-c', full_command  # Execute command to set up keyrings and APT configuration inside the container
+    ]
+
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Running command in Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
 class PackageException(Exception):
     pass
 
@@ -98,34 +162,28 @@ def build_docker_image():
     subprocess.run(['docker', 'build', '-t', 'debrebuild', '.'], check=True)
     logger.debug("Docker image built.")
 
-def run_in_docker(command, *file_paths):
-    # Prepare mounts for each file path provided
-    mounts = []
-    for file_path in file_paths:
-        filename = os.path.basename(file_path)
-        mount = f'{file_path}:/tmp/{filename}'
-        mounts.append('-v')
-        mounts.append(mount)
 
-    # Assemble the full Docker command
+def run_in_docker(command):
+    current_directory = os.getcwd()
+
+    # Assemble the Docker command with the entire current directory mounted
     cmd = [
         'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
-        *mounts,  # Add all file mounts to the command
-        '-v', f'{os.getcwd()}:/app',
-        '-w', '/app',
+        '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
+        '-w', '/app',  # Set working directory to /app
         '--entrypoint', '/bin/bash',
         'debrebuild',
-        '-c', f"mkdir -p /tmp && {command}"  # Ensure /tmp exists and run the command
+        '-c', command  # Directly run the provided command in the container
     ]
 
-    # Execute the Docker command
     result = subprocess.run(cmd, capture_output=True, text=True)
-    logger.debug(f"Running command in Docker: {' '.join(cmd)}")
-    logger.debug("Command output: " + result.stdout)
-    logger.error("Command error output: " + result.stderr)
+    print("Running command in Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
 
     if result.returncode != 0:
-        logger.error(f"Command failed with exit code {result.returncode}")
+        print(f"Command failed with exit code {result.returncode}")
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
 def debug_docker():
@@ -202,17 +260,28 @@ def run(builder_args):
     logger.debug("Starting the run function")
 
     bootstrap_build_base_system()
+    setup_keyrings_in_docker()
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".json", mode='w') as tf:
+    # Use the current directory to store the temporary file
+    current_directory = os.getcwd()
+    temp_file_path = os.path.join(current_directory, "temp_args.json")
+
+    # Create a temporary JSON file with example data in the current directory
+    with open(temp_file_path, 'w') as tf:
         json.dump(builder_args, tf)
-        builder_args_json_file = tf.name
 
+    # Call to run the command in Docker with the file accessible
     try:
-        run_in_docker(f'source /app/venv/bin/activate && python3 initialize_and_find_dependencies.py {builder_args_json_file}')
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to initialize and find dependencies: {e}")
+        run_in_docker(f"source /app/venv/bin/activate && python3 initialize_and_find_dependencies.py /app/{os.path.basename(temp_file_path)}")
+    except Exception as e:
+        print("Error running command in Docker:", e)
+        # Assuming debug_docker() is a function you've defined to help with debugging
         debug_docker()
+        # Assuming RebuilderException is a custom exception you've defined
         raise RebuilderException("Failed to initialize and find dependencies")
+    finally:
+        # Clean up by removing the temporary file
+        os.remove(temp_file_path)
 
     output_dir = builder_args["output_dir"]
 
@@ -226,7 +295,8 @@ def run(builder_args):
         raise RebuilderException("Checkpoint JSON file not found")
 
     try:
-        run_in_docker(f'source /app/venv/bin/activate && python3 execute_build.py {checkpoint_json_path} {output_dir}')
+        run_in_docker(f"source /app/venv/bin/activate && python3 execute_build.py"
+                      f" {checkpoint_json_path}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to execute build: {e}")
         debug_docker()
@@ -242,7 +312,8 @@ def run(builder_args):
     logger.debug(f"Using buildinfo file: {new_buildinfo_file}")
 
     try:
-        run_in_docker(f'source /app/venv/bin/activate && python3 post_build_actions.py {checkpoint_json_path} {output_dir}')
+        run_in_docker(f"source /app/venv/bin/activate && python3 post_build_actions.py"
+                      f" {checkpoint_json_path}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to perform post-build actions: {e}")
         debug_docker()

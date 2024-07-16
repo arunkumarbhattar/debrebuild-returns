@@ -34,20 +34,20 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
 DEBIAN_KEYRINGS = [
-    "/usr/share/keyrings/debian-archive-bullseye-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-bullseye-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-bullseye-stable.gpg",
-    "/usr/share/keyrings/debian-archive-buster-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-buster-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-buster-stable.gpg",
-    "/usr/share/keyrings/debian-archive-keyring.gpg",
-    "/usr/share/keyrings/debian-archive-removed-keys.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-stable.gpg",
-    "/usr/share/keyrings/debian-ports-archive-keyring-removed.gpg",
-    "/usr/share/keyrings/debian-ports-archive-keyring.gpg",
-    "/usr/share/keyrings/debian-keyring.gpg",
+    "/app/keyrings/debian-archive-bullseye-automatic.gpg",
+    "/app/keyrings/debian-archive-bullseye-security-automatic.gpg",
+    "/app/keyrings/debian-archive-bullseye-stable.gpg",
+    "/app/keyrings/debian-archive-buster-automatic.gpg",
+    "/app/keyrings/debian-archive-buster-security-automatic.gpg",
+    "/app/keyrings/debian-archive-buster-stable.gpg",
+    "/app/keyrings/debian-archive-keyring.gpg",
+    "/app/keyrings/debian-archive-removed-keys.gpg",
+    "/app/keyrings/debian-archive-stretch-automatic.gpg",
+    "/app/keyrings/debian-archive-stretch-security-automatic.gpg",
+    "/app/keyrings/debian-archive-stretch-stable.gpg",
+    "/app/keyrings/debian-ports-archive-keyring-removed.gpg",
+    "/app/keyrings/debian-ports-archive-keyring.gpg",
+    "/app/keyrings/debian-keyring.gpg",
 ]
 
 
@@ -253,7 +253,7 @@ class Rebuilder:
                  extra_repository_files=None,
                  extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None,
                  use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False,
-                 custom_package=None):
+                 custom_package=None, output_dir=""):
         self.custom_deb = custom_deb
         self.rebuilder_buildinfo_metadata_path = None
         self.builder_json_file = builder_json_file
@@ -279,7 +279,7 @@ class Rebuilder:
         self.tempaptdir = None
         self.tempaptcache = None
         self.required_timestamp_sources = {}
-        self.tmpdir = os.environ.get("TMPDIR", "/tmp")
+        self.tmpdir = os.environ.get("TMPDIR", "/app/build_checkpoint/tmp/")
         self.buildinfo_file = None
         self.custom_package = custom_package
         self.custom_package_dir = None  # Directory where custom package is prepared
@@ -287,6 +287,7 @@ class Rebuilder:
         self.bypassed_packages = set()
         self.updated_packages = {}
         self.newly_added_sources = []
+        self.output_dir = output_dir
 
         logger.debug(f"Input buildinfo: {buildinfo_file}")
 
@@ -344,7 +345,8 @@ class Rebuilder:
             "checkpoint_files": self.checkpoint_files,
             "rebuilder_buildinfo_metadata_path": self.rebuilder_buildinfo_metadata_path,
             "buildinfo_pickle_file": self.buildinfo_pickle_file,
-            "custom_deb": self.custom_deb
+            "custom_deb": self.custom_deb,
+            "output_dir": self.output_dir
         }
 
     @staticmethod
@@ -377,7 +379,8 @@ class Rebuilder:
             use_metasnap=data["use_metasnap"],
             metasnap_url=data["metasnap_url"],
             build_options_nocheck=data["build_options_nocheck"],
-            custom_package=data["custom_package"]
+            custom_package=data["custom_package"],
+            output_dir=data["output_dir"]
         )
         instance.tempaptdir = data["tempaptdir"]
         instance.required_timestamp_sources = data["required_timestamp_sources"]
@@ -393,6 +396,8 @@ class Rebuilder:
         instance.buildinfo_pickle_file = data["buildinfo_pickle_file"]
         instance.buildinfo = RebuilderBuildInfo.from_pickle_file(instance.buildinfo_pickle_file)
         instance.custom_deb = data["custom_deb"]
+        instance.output_dir = data["output_dir"]
+
         return instance
 
     def to_json_file(self, filepath):
@@ -420,7 +425,7 @@ class Rebuilder:
             raise RebuilderException(f"Unsupported custom package format: {self.custom_package}")
 
     def setup_local_repository(self):
-        local_repo_dir = "/tmp/local_repo"
+        local_repo_dir = "/app/build_checkpoint/tmp/local_repo"
         os.makedirs(local_repo_dir, exist_ok=True)
 
         # Copy user-provided .deb files to the local repository directory
@@ -578,7 +583,7 @@ class Rebuilder:
             return False
 
         # Use a common local repository directory
-        local_repo_dir = "/tmp/local_repo"
+        local_repo_dir = "/app/build_checkpoint/tmp/local_repo"
         os.makedirs(local_repo_dir, exist_ok=True)
         deb_file_path = os.path.join(local_repo_dir, deb_file_name)
 
@@ -723,6 +728,9 @@ def bootstrap_build_base_system(rebuilder):
     cleanup_and_create_checkpoint(rebuilder)
 
 def pre_checks_for_keyrings():
+    # Define the path to the keyrings directory inside the Docker container
+    container_keyring_dir = "/app/keyrings/keyrings"
+
     logger.debug("Performing pre-checks for keyrings...")
     for key in DEBIAN_KEYRINGS:
         if not os.path.exists(key):
@@ -856,6 +864,10 @@ def find_build_dependencies(rebuilder):
 
 
 def prepare_aptcache(rebuilder):
+    # Ensure the base temporary directory exists
+    if not os.path.exists(rebuilder.tmpdir):
+        os.makedirs(rebuilder.tmpdir)
+
     # create a temporary directory where all APT configuration files will be stored
     rebuilder.tempaptdir = tempfile.mkdtemp(prefix="debrebuild-", dir=rebuilder.tmpdir)
     logger.debug(f"Temporary APT directory: {rebuilder.tempaptdir}")
@@ -1232,9 +1244,12 @@ def get_sources_list_from_timestamp(self):
 if __name__ == "__main__":
     builder_json_file = sys.argv[1]
 
+    print("builder json file path is {builder_json_file}")
     # Load the builder arguments from the JSON file
     with open(builder_json_file, 'r') as f:
         builder_args = json.load(f)
+
+    print("Updated builder arguments:", builder_args)
 
     # Create the Rebuilder instance using the arguments dictionary
     rebuilder = Rebuilder(
@@ -1251,7 +1266,8 @@ if __name__ == "__main__":
         proxy=builder_args["proxy"],
         use_metasnap=builder_args["use_metasnap"],
         metasnap_url=builder_args["metasnap_url"],
-        build_options_nocheck=builder_args["build_options_nocheck"]
+        build_options_nocheck=builder_args["build_options_nocheck"],
+        output_dir=builder_args["output_dir"]
     )
 
     bootstrap_build_base_system(rebuilder)

@@ -284,7 +284,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     temp_dir = os.path.join(rebuilder.checkpoint_dir, os.path.basename(rebuilder.tempaptdir))
 
     # Ensure TMPDIR is correctly set
-    rebuilder.tmpdir = "/tmp/mmdebstrap_tmp"
+    rebuilder.tmpdir = "/app/build_checkpoint/tmp/mmdebstrap_tmp"
     if not os.path.exists(rebuilder.tmpdir):
         os.makedirs(rebuilder.tmpdir)
 
@@ -360,7 +360,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     if rebuilder.consider_local_repo or rebuilder.custom_deb:
         logger.debug("DEBBIE")
         # Ensure the local repository directory exists
-        local_repo_dir = "/tmp/local_repo"
+        local_repo_dir = "/app/build_checkpoint/tmp/local_repo"
         packages_file_src = os.path.join(local_repo_dir, "Packages")
 
         # Modify the Filename field in the Packages file to reflect the new path
@@ -422,8 +422,8 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         # Ensure the directory exists inside the chroot before copying the local repository
         cmd += [
             '--essential-hook=chroot "$1" mkdir -p /mnt/local_repo',
-            '--essential-hook=ls /tmp/local_repo',  # Verify the contents of the source directory
-            '--essential-hook=cp -r /tmp/local_repo/* "$1"/mnt/local_repo/',
+            '--essential-hook=ls /app/build_checkpoint/tmp/local_repo',  # Verify the contents of the source directory
+            '--essential-hook=cp -r /app/build_checkpoint/tmp/local_repo/* "$1"/mnt/local_repo/',
             '--essential-hook=ls "$1"/mnt/local_repo',  # Verify the contents of the target directory after copying
             '--essential-hook=chroot "$1" sh -c "echo \'\ndeb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',
             '--essential-hook=chroot "$1" sh -c "cd /mnt/local_repo && dpkg-scanpackages . | gzip -c > Packages.gz"',
@@ -763,12 +763,11 @@ def get_response(rebuilder, url):
 def main():
     import sys
 
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 2:
         logger.debug("Usage: python execute_build.py <rebuilder_json_file> <output_directory>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
-    output_dir = sys.argv[2]
 
     # Load the Rebuilder instance from the JSON file
     with open(rebuilder_json_file, 'r') as f:
@@ -779,7 +778,7 @@ def main():
     # Call the execute_build function with the Rebuilder instance
     builder = "mmdebstrap"  # or get this from some config if needed
 
-    execute_build(rebuilder, builder, output_dir)
+    execute_build(rebuilder, builder, rebuilder_data["output_dir"])
 
 
 if __name__ == "__main__":
