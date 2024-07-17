@@ -208,7 +208,7 @@ ENV PYTHONPATH="/usr/lib/python3/dist-packages:$PYTHONPATH"
 RUN /app/venv/bin/pip install --upgrade pip
 
 # Install necessary Python libraries using the virtual environment’s pip
-RUN /app/venv/bin/pip install requests beautifulsoup4 python-debian python-dateutil rstr google-auth
+RUN /app/venv/bin/pip install requests beautifulsoup4 python-debian python-dateutil rstr google-auth httpx tenacity
 
 # Copy all application files
 COPY . /app
@@ -235,18 +235,6 @@ def build_docker_image():
 
 
 def run_in_docker(command):
-    current_directory = os.getcwd()
-    volumes = []
-
-    # # List all directories within the current directory and prepare volume mounts
-    # for item in os.listdir(current_directory):
-    #     item_path = os.path.join(current_directory, item)
-    #     if os.path.isdir(item_path):
-    #         volumes.append(f"{item_path}:/app/{item}")
-    #
-    # # Convert list of volumes to Docker volume arguments
-    # volume_args = sum([['-v', volume] for volume in volumes], [])
-
     # Assemble the Docker command
     cmd = [
         'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
@@ -266,6 +254,12 @@ def run_in_docker(command):
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}")
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+def create_directory_in_docker(directory_path):
+    # Construct the command to create the directory
+    command = f"mkdir -p {directory_path}"
+    # Call the function to run this command in Docker
+    run_in_docker(command)
 
 def copy_to_docker(source, destination):
     current_directory = os.getcwd()
@@ -518,7 +512,7 @@ def run(builder_args):
 
     # List of packages to install
     packages = [
-        'requests', 'beautifulsoup4', 'python-debian', 'python-dateutil', 'rstr', 'google-auth'
+        'requests', 'beautifulsoup4', 'python-debian', 'python-dateutil', 'rstr', 'google-auth', 'httpx', 'tenacity'
     ]
 
     # Construct the command to create a virtual environment and install the packages
@@ -535,6 +529,9 @@ def run(builder_args):
     run_docker_container(output_dir)
     create_persistent_json_file(builder_args)
 
+    test_command = "python3 test_httpx_import.py"
+    run_in_docker(test_command)
+
     # # Copy the temp file into /app directory inside the Docker container
     # copy_to_docker("temp_args.json", "temp_args.json")
     #
@@ -550,14 +547,15 @@ def run(builder_args):
         # Assuming RebuilderException is a custom exception you've defined
         raise RebuilderException("Failed to initialize and find dependencies")
 
+    output_dir = builder_args["output_dir"]
     source_name = get_source_name_from_buildinfo(builder_args["buildinfo_file"])
     checkpoint_dir = os.path.join("build_checkpoint", source_name)
+    final_output_dir = os.path.join(checkpoint_dir, output_dir)
+
+    # Create the output directory inside the Docker container
+    create_directory_in_docker(final_output_dir)
     checkpoint_file = f"checkpoint_find_dep_{source_name}.json"
     checkpoint_json_path = os.path.join(checkpoint_dir, checkpoint_file)
-
-    # if not os.path.exists(checkpoint_json_path):
-    #     logger.error(f"Checkpoint JSON file not found: {checkpoint_json_path}")
-    #     raise RebuilderException("Checkpoint JSON file not found")
 
     try:
         run_python_in_docker(f"execute_build.py"
@@ -567,18 +565,9 @@ def run(builder_args):
         debug_docker()
         raise RebuilderException("Failed to execute build")
 
-    logger.debug("Finding buildinfo files in output directory...")
-    buildinfo_files = glob.glob(os.path.join(output_dir, "*.buildinfo"))
-    if not buildinfo_files:
-        logger.error("No buildinfo file found in the output directory.")
-        raise BuildInfoException("Cannot find any buildinfo file in the specified directory.")
-
-    new_buildinfo_file = max(buildinfo_files, key=os.path.getmtime)
-    logger.debug(f"Using buildinfo file: {new_buildinfo_file}")
-
     try:
         run_python_in_docker(f"post_build_actions.py"
-                      f" {checkpoint_json_path}")
+                      f" {checkpoint_json_path} {final_output_dir}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to perform post-build actions: {e}")
         debug_docker()

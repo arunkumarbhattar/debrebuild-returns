@@ -254,11 +254,12 @@ def post_build_actions(rebuilder, output):
 def main():
     import sys
 
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 3:
         logger.debug("Usage: python post_build_actions.py <rebuilder_json_file> <output_directory>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
+    artifacts_dir = sys.argv[1]
 
     # Load the Rebuilder instance from the JSON file
     with open(rebuilder_json_file, 'r') as f:
@@ -268,7 +269,7 @@ def main():
     rebuilder.buildinfo = RebuilderBuildInfo(rebuilder.buildinfo_file)
 
     # Call the post_build_actions function with the Rebuilder instance
-    post_build_actions(rebuilder, rebuilder_data["output_dir"])
+    post_build_actions(rebuilder, artifacts_dir)
 
 if __name__ == "__main__":
     main()

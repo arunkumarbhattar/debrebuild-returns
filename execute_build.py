@@ -515,7 +515,6 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         ]
         logging.debug("Added preparation of build directory and source package download to mmdebstrap command")
 
-        output = "/home/arun/Desktop/debrebuild/artifacts"
         # Revised sync-out command
         cmd += [
             '--customize-hook=sync-out {custom_unpack_dir} {output}'.format(custom_unpack_dir="/build/src_dir",
@@ -754,7 +753,7 @@ def main():
     import sys
 
     if len(sys.argv) != 2:
-        logger.debug("Usage: python execute_build.py <rebuilder_json_file> <output_directory>")
+        logger.debug("Usage: python execute_build.py <rebuilder_json_file>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
