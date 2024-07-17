@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import glob
+from datetime import time
 
 import debian.deb822
 
@@ -220,7 +221,7 @@ RUN chmod +x /bin/zsh
 SHELL ["/bin/zsh", "-c"]
 
 # Entry point
-ENTRYPOINT ["/bin/zsh", "/app/custom_entrypoint.sh"]
+ENTRYPOINT ["/bin/zsh"]
 """
 
 def write_dockerfile(dockerfile_content):
@@ -235,17 +236,112 @@ def build_docker_image():
 
 def run_in_docker(command):
     current_directory = os.getcwd()
+    volumes = []
 
-    # Assemble the Docker command with the entire current directory mounted
+    # # List all directories within the current directory and prepare volume mounts
+    # for item in os.listdir(current_directory):
+    #     item_path = os.path.join(current_directory, item)
+    #     if os.path.isdir(item_path):
+    #         volumes.append(f"{item_path}:/app/{item}")
+    #
+    # # Convert list of volumes to Docker volume arguments
+    # volume_args = sum([['-v', volume] for volume in volumes], [])
+
+    # Assemble the Docker command
     cmd = [
-        'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
-        '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
-        '-w', '/app',  # Set working directory to /app
-        '--entrypoint', '/bin/zsh',
-        'debrebuild',
-        '-c', command  # Directly run the provided command in the container
+        'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
+        #*volume_args,  # Spread the volume arguments
+        '-w', '/app',  # Set working directory to /app inside the container
+        '--entrypoint', '/bin/bash', 'debrebuild',  # Assuming bash is available and image name is debrebuild
+        '-c', command  # Command to run inside Docker
     ]
 
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Running command in Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+def copy_to_docker(source, destination):
+    current_directory = os.getcwd()
+
+    # Ensure the source file path is correct
+    source_path = os.path.join(current_directory, source)
+
+    # Check if the source file exists
+    if not os.path.exists(source_path):
+        raise FileNotFoundError(f"The source file does not exist: {source_path}")
+
+    # Assemble the Docker command to copy the file
+    cmd = [
+        'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
+        '-v', f"{current_directory}:/app/host",  # Mount the current directory to /app/host
+        '--entrypoint', '/bin/bash', 'debrebuild',  # Using bash as the entrypoint and debrebuild as the image name
+        '-c', f"cp /app/host/{source} /app/{destination}"  # Ensure the destination is correctly specified
+    ]
+
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    # Logging the command and results
+    print("Copying file to Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    # Check if the command was successful
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+def copy_from_docker(source, destination):
+    current_directory = os.getcwd()
+
+    # Ensure the destination file path is correct
+    destination_path = os.path.join(current_directory, destination)
+
+    # Assemble the Docker command to copy the file
+    cmd = [
+        'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
+        '-v', f"{current_directory}:/app/host",  # Mount the current directory to /app/host
+        '--entrypoint', '/bin/bash', 'debrebuild',  # Assuming bash is available and image name is debrebuild
+        '-c', f"cp {source} /app/host/{destination}"  # Command to copy the file inside Docker
+    ]
+
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Copying file from Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+
+def run_python_in_docker(command):
+    current_directory = os.getcwd()
+    build_checkpoint_path = os.path.join(current_directory, 'build_checkpoint')
+
+    # Ensure the build_checkpoint directory is mounted
+    volume_mount = f"{build_checkpoint_path}:/app/build_checkpoint"
+
+    # Assemble the Docker command with volume mounts
+    cmd = [
+        'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
+        '-v', volume_mount,  # Mount the build_checkpoint directory to /app/build_checkpoint in the container
+        '-w', '/app',  # Set working directory to /app inside the container
+        '--entrypoint', '/bin/bash', 'debrebuild',  # Using bash and debrebuild as the image name
+        '-c', f"python3 {command}"  # Run the specified Python command
+    ]
+
+    # Execute the Docker command
     result = subprocess.run(cmd, capture_output=True, text=True)
     print("Running command in Docker:", ' '.join(cmd))
     print("Command output:", result.stdout)
@@ -258,7 +354,7 @@ def run_in_docker(command):
 
 def debug_docker():
     logger.debug("Starting Docker container in interactive mode for debugging...")
-    subprocess.run(['docker', 'run', '--rm', '-it', '-v', f'{os.getcwd()}:/app', '-w', '/app', 'debrebuild', 'sh'], check=True)
+    subprocess.run(['docker', 'run', '--rm', '-it', '-v', f'{os.getcwd()}:/app', '-w', '/app', 'debrebuild', 'bash'], check=True)
 
 def setup_directories():
     if not os.path.exists('temp_apt_cache'):
@@ -267,10 +363,24 @@ def setup_directories():
         os.makedirs('chroot_env')
     logger.debug("Directories setup complete.")
 
+def setup_directories_in_docker():
+    # Bash commands to create directories inside the Docker container
+    command = "mkdir -p /app/temp_apt_cache /app/chroot_env && echo 'Directories setup complete.'"
+
+    # Run the command inside Docker
+    run_in_docker(command)
+
 def initialize_configurations():
     os.environ['APT_CACHE_DIR'] = os.path.abspath('temp_apt_cache')
     os.environ['CHROOT_ENV'] = os.path.abspath('chroot_env')
     logger.debug("Configurations initialized.")
+
+def initialize_configurations_in_docker():
+    # Commands to set environment variables inside Docker
+    command = "export APT_CACHE_DIR=/app/temp_apt_cache && export CHROOT_ENV=/app/chroot_env && echo $APT_CACHE_DIR && echo $CHROOT_ENV"
+
+    # Run the command inside Docker
+    run_in_docker(command)
 
 def install_core_dependencies():
     subprocess.run(['sudo', 'apt-get', 'update'], check=True)
@@ -288,11 +398,20 @@ def prepare_execution_environment():
     subprocess.run(['sudo', 'debootstrap', '--variant=minbase', 'stable', chroot_env], check=True)
     logger.debug("Execution environment prepared.")
 
+def prepare_execution_environment_in_docker():
+    # Bash commands to clean and prepare the chroot environment inside the Docker container
+    chroot_env = "/app/chroot_env"  # Ensure this matches with Docker's internal paths used in other functions
+    command = (f"rm -rf {chroot_env} && mkdir -p {chroot_env} && debootstrap --variant=minbase stable {chroot_env} "
+               f"&& echo 'Execution environment prepared.'")
+
+    # Run the command inside Docker
+    run_in_docker(command)
+
 def bootstrap_build_base_system():
-    setup_directories()
-    initialize_configurations()
+    setup_directories_in_docker()
+    initialize_configurations_in_docker()
     install_core_dependencies()
-    prepare_execution_environment()
+    prepare_execution_environment_in_docker()
     logger.debug("Build base system bootstrapped successfully.")
 
 def get_source_name_from_buildinfo(buildinfo_file):
@@ -326,6 +445,81 @@ def verify_checksum(package_name, expected_checksum):
     checksum = subprocess.check_output(['sha256sum', built_package]).split()[0]
     assert checksum == expected_checksum, "Checksum does not match!"
 
+
+def prepare_volume(directory_name):
+    current_directory = os.getcwd()
+    path = os.path.join(current_directory, directory_name)
+
+    # Ensure the directory exists
+    if not os.path.exists(path):
+        os.makedirs(path)
+        print(f"'{directory_name}' directory created at: {path}")
+
+    return f"{path}:/app/{directory_name}"
+
+def run_docker_container(output_dir):
+    build_checkpoint_volume = prepare_volume('build_checkpoint')
+    output_dir_volume = prepare_volume(output_dir)
+
+    # Docker command to create a test file in each mounted directory
+    cmd = [
+        'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
+        '--privileged',  # Run the container with extended privileges
+        '-v', build_checkpoint_volume,  # Mount the build_checkpoint directory
+        '-v', output_dir_volume,  # Mount the output_dir directory
+        '-w', '/app',  # Set working directory to /app
+        '--entrypoint', '/bin/bash', 'debrebuild',  # Use bash in the debrebuild image
+        '-c', "touch /app/build_checkpoint/test_file.txt && echo 'Test content' > /app/build_checkpoint/test_file.txt && \
+               touch /app/output_dir/test_file.txt && echo 'Test content' > /app/output_dir/test_file.txt && \
+               ls -l /app/build_checkpoint /app/output_dir"  # Create and list test files
+    ]
+
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Running command in Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+    # Verify the file's existence on the host for both directories
+    for volume in [build_checkpoint_volume, output_dir_volume]:
+        host_dir = volume.split(':')[0]
+        test_file_path = os.path.join(host_dir, "test_file.txt")
+        if os.path.exists(test_file_path):
+            with open(test_file_path, 'r') as file:
+                contents = file.read()
+            print(f"Verified file in '{host_dir}': {contents}")
+        else:
+            print(f"File not found in '{host_dir}'.")
+
+def check_host_file(directory):
+    test_file_path = os.path.join(directory, "test_file.txt")
+    try:
+        with open(test_file_path, 'r') as file:
+            print(f"Contents of test file on host: {file.read()}")
+    except FileNotFoundError:
+        print("Test file not found on the host. Check volume mount.")
+
+def create_persistent_json_file(builder_args):
+    # Use the current directory or a specific path to store the JSON file
+    current_directory = os.getcwd()
+    json_file_path = os.path.join(current_directory, "persistent_args.json")
+
+    # Create a JSON file with example data in the current directory
+    with open(json_file_path, 'w') as jf:
+        json.dump(builder_args, jf)
+
+    # Print the file path and confirm the contents of the file
+    print(f"Persistent JSON file path: {json_file_path}")
+    with open(json_file_path, 'r') as jf:
+        file_contents = json.load(jf)
+        print("Contents of the persistent JSON file:")
+        print(json.dumps(file_contents, indent=4))
+
 def run(builder_args):
     logger.debug("Starting the run function")
 
@@ -333,41 +527,52 @@ def run(builder_args):
     setup_keyrings_in_docker()
     setup_custom_zgrep_in_docker()
 
-    # Use the current directory to store the temporary file
-    current_directory = os.getcwd()
-    temp_file_path = os.path.join(current_directory, "temp_args.json")
+    # List of packages to install
+    packages = [
+        'requests', 'beautifulsoup4', 'python-debian', 'python-dateutil', 'rstr', 'google-auth'
+    ]
 
-    # Create a temporary JSON file with example data in the current directory
-    with open(temp_file_path, 'w') as tf:
-        json.dump(builder_args, tf)
+    # Construct the command to create a virtual environment and install the packages
+    venv_command = (
+        "apt-get update && apt-get install -y python3-pip python3-venv && "
+        "python3 -m venv /app/venv && "
+#        "/app/venv/bin/pip install --upgrade pip && "
+        f"/app/venv/bin/pip install {' '.join(packages)}"
+    )
+    output_dir = builder_args["output_dir"]
+    # Run the virtual environment creation and package installation command in the Docker container
+    run_in_docker(venv_command)
 
+    run_docker_container(output_dir)
+    create_persistent_json_file(builder_args)
+
+    # # Copy the temp file into /app directory inside the Docker container
+    # copy_to_docker("temp_args.json", "temp_args.json")
+    #
+    # time(5)
     # Call to run the command in Docker with the file accessible
+    json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
     try:
-        run_in_docker(f"source /app/venv/bin/activate && python3 initialize_and_find_dependencies.py /app/{os.path.basename(temp_file_path)}")
+        run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}")
     except Exception as e:
         print("Error running command in Docker:", e)
         # Assuming debug_docker() is a function you've defined to help with debugging
         debug_docker()
         # Assuming RebuilderException is a custom exception you've defined
         raise RebuilderException("Failed to initialize and find dependencies")
-    finally:
-        # Clean up by removing the temporary file
-        os.remove(temp_file_path)
-
-    output_dir = builder_args["output_dir"]
 
     source_name = get_source_name_from_buildinfo(builder_args["buildinfo_file"])
     checkpoint_dir = os.path.join("build_checkpoint", source_name)
     checkpoint_file = f"checkpoint_find_dep_{source_name}.json"
     checkpoint_json_path = os.path.join(checkpoint_dir, checkpoint_file)
 
-    if not os.path.exists(checkpoint_json_path):
-        logger.error(f"Checkpoint JSON file not found: {checkpoint_json_path}")
-        raise RebuilderException("Checkpoint JSON file not found")
+    # if not os.path.exists(checkpoint_json_path):
+    #     logger.error(f"Checkpoint JSON file not found: {checkpoint_json_path}")
+    #     raise RebuilderException("Checkpoint JSON file not found")
 
     try:
-        run_in_docker(f"source /app/venv/bin/activate && python3 execute_build.py"
-                      f" {checkpoint_json_path}")
+        run_python_in_docker(f"execute_build.py"
+                      f" /app/{checkpoint_json_path}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to execute build: {e}")
         debug_docker()
@@ -383,7 +588,7 @@ def run(builder_args):
     logger.debug(f"Using buildinfo file: {new_buildinfo_file}")
 
     try:
-        run_in_docker(f"source /app/venv/bin/activate && python3 post_build_actions.py"
+        run_python_in_docker(f"post_build_actions.py"
                       f" {checkpoint_json_path}")
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to perform post-build actions: {e}")

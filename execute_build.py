@@ -291,13 +291,20 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     # Copy all files from temp_dir to rebuilder.tmpdir
     subprocess.run(["cp", "-r", temp_dir, rebuilder.tmpdir], check=True)
 
+    script_dir = "/opt/scripts"
+    script_path = os.path.join(script_dir, "custom_zgrep.sh")
+
+    # Ensure the scripts directory exists
+    os.makedirs(script_dir, exist_ok=True)
+
+    # Define the custom zgrep script
     custom_zgrep_script = """#!/bin/bash
 # Custom zgrep to avoid process substitution issues
 # Usage: zgrep -h -f <pattern_file> <compressed_files...>
 
 if [ "$1" = "-h" ] && [ "$2" = "-f" ]; then
-    pattern_file=$2
-    shift 2
+    pattern_file=$3
+    shift 3
     tmp_pattern_file=$(mktemp)
 
     # Read the pattern from the input file descriptor and write it to a temporary file
@@ -335,10 +342,7 @@ fi
         '--aptopt=Acquire::http::Dl-Limit "1000";',
         '--aptopt=Acquire::https::Dl-Limit "1000";',
         '--aptopt=Acquire::Retries "5";',
-        '--aptopt=APT::Get::allow-downgrades "true";',
-        f'--customize-hook=copy-in {script_path} /custom_zgrep.sh',
-        '--customize-hook=chroot "$1" chmod +x /custom_zgrep.sh',
-        '--customize-hook=chroot "$1" mv /custom_zgrep.sh /usr/local/bin/zgrep'
+        '--aptopt=APT::Get::allow-downgrades "true";'
     ]
 
     logging.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
