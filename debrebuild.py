@@ -470,7 +470,6 @@ def run_docker_container(output_dir):
         '-w', '/app',  # Set working directory to /app
         '--entrypoint', '/bin/bash', 'debrebuild',  # Use bash in the debrebuild image
         '-c', f"touch /app/build_checkpoint/test_file.txt && echo 'Test content' > /app/build_checkpoint/test_file.txt && \
-               touch /app/{output_dir}/test_file.txt && echo 'Test content' > /app/{output_dir}/test_file.txt && \
                ls -l /app/build_checkpoint /app/{output_dir}"  # Create and list test files
     ]
 
@@ -485,16 +484,6 @@ def run_docker_container(output_dir):
         print(f"Command failed with exit code {result.returncode}")
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
-    # Verify the file's existence on the host for both directories
-    for volume in [build_checkpoint_volume, output_dir_volume]:
-        host_dir = volume.split(':')[0]
-        test_file_path = os.path.join(host_dir, "test_file.txt")
-        if os.path.exists(test_file_path):
-            with open(test_file_path, 'r') as file:
-                contents = file.read()
-            print(f"Verified file in '{host_dir}': {contents}")
-        else:
-            print(f"File not found in '{host_dir}'.")
 
 def check_host_file(directory):
     test_file_path = os.path.join(directory, "test_file.txt")

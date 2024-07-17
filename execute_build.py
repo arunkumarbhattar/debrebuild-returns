@@ -124,7 +124,7 @@ def mmdebstrap(rebuilder, output):
         logging.error(f"mmdebstrap failed with error: {result.stderr}")
         raise RebuilderException("mmdebstrap failed")
     else:
-        logging.info(f"mmdebstrap completed successfully: {result.stdout}")
+        logger.debug(f"mmdebstrap completed successfully: {result.stdout}")
 
 
 def is_source_available(self):
@@ -290,44 +290,6 @@ def generate_mmdebstrap_cmd(rebuilder, output):
 
     # Copy all files from temp_dir to rebuilder.tmpdir
     subprocess.run(["cp", "-r", temp_dir, rebuilder.tmpdir], check=True)
-
-    script_dir = "/opt/scripts"
-    script_path = os.path.join(script_dir, "custom_zgrep.sh")
-
-    # Ensure the scripts directory exists
-    os.makedirs(script_dir, exist_ok=True)
-
-    # Define the custom zgrep script
-    custom_zgrep_script = """#!/bin/bash
-# Custom zgrep to avoid process substitution issues
-# Usage: zgrep -h -f <pattern_file> <compressed_files...>
-
-if [ "$1" = "-h" ] && [ "$2" = "-f" ]; then
-    pattern_file=$3
-    shift 3
-    tmp_pattern_file=$(mktemp)
-
-    # Read the pattern from the input file descriptor and write it to a temporary file
-    cat "$pattern_file" > "$tmp_pattern_file"
-
-    # Execute the original zgrep with the temporary pattern file
-    /bin/zgrep -h -f "$tmp_pattern_file" "$@"
-
-    # Clean up the temporary file
-    rm -f "$tmp_pattern_file"
-else
-    # Fallback to the original zgrep for other usages
-    /bin/zgrep "$@"
-fi
-"""
-
-    # Save the custom zgrep script to a file
-    script_path = os.path.join(rebuilder.tmpdir, "custom_zgrep.sh")
-    with open(script_path, "w") as script_file:
-        script_file.write(custom_zgrep_script)
-
-    # Make sure the custom script is executable
-    os.chmod(script_path, 0o755)
 
     cmd = [
         "env",
@@ -722,7 +684,7 @@ def create_docker_snapshot(rebuilder, cmd):
         logging.error(f"Docker build failed with error: {result.stderr}")
         raise RebuilderException("Docker build failed")
     else:
-        logging.info(f"Docker image {image_name} created successfully: {result.stdout}")
+        logger.debug(f"Docker image {image_name} created successfully: {result.stdout}")
 
 
 def get_chroot_basemirror(rebuilder):
