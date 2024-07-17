@@ -67,9 +67,74 @@ def setup_keyrings_in_docker():
         '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
         '-v', '/usr/share/keyrings:/usr/share/keyrings',  # Mount the host's keyrings directory
         '-w', '/app',  # Set working directory to /app
-        '--entrypoint', '/bin/bash',
+        '--entrypoint', '/bin/zsh',
         'debrebuild',
         '-c', full_command  # Execute command to set up keyrings and APT configuration inside the container
+    ]
+
+    # Execute the Docker command
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    print("Running command in Docker:", ' '.join(cmd))
+    print("Command output:", result.stdout)
+    if result.stderr:
+        print("Command error output:", result.stderr)
+
+    if result.returncode != 0:
+        print(f"Command failed with exit code {result.returncode}")
+        raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
+
+def setup_custom_zgrep_in_docker():
+    # Define the custom zgrep script content
+    custom_zgrep_script = """
+#!/bin/bash
+
+# Custom zgrep to avoid process substitution issues
+# Usage: zgrep -h -f <pattern_file> <compressed_files...>
+
+if [ "$1" = "-h" ] && [ "$2" = "-f" ]; then
+    pattern_file=$2
+    shift 2
+    tmp_pattern_file=$(mktemp)
+
+    # Read the pattern from the input file descriptor and write it to a temporary file
+    cat "$pattern_file" > "$tmp_pattern_file"
+
+    # Execute the original zgrep with the temporary pattern file
+    /bin/zgrep -h -f "$tmp_pattern_file" "$@"
+
+    # Clean up the temporary file
+    rm -f "$tmp_pattern_file"
+else
+    # Fallback to the original zgrep for other usages
+    /bin/zgrep "$@"
+fi
+"""
+
+    # Create a temporary script file to be copied into the Docker container
+    script_path = os.path.join(os.getcwd(), "custom_zgrep.sh")
+    with open(script_path, "w") as script_file:
+        script_file.write(custom_zgrep_script)
+
+    # Make the script executable
+    os.chmod(script_path, 0o755)
+
+    # Docker command to copy the script to the virtual environment's bin directory and set it up
+    setup_script_command = """
+mkdir -p /app/venv/bin &&
+cp /app/custom_zgrep.sh /app/venv/bin/zgrep &&
+chmod +x /app/venv/bin/zgrep
+"""
+
+    # Assemble the Docker command with the entire current directory mounted
+    current_directory = os.getcwd()
+    cmd = [
+        'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
+        '--privileged',  # Run the container with extended privileges
+        '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
+        '-w', '/app',  # Set working directory to /app
+        '--entrypoint', '/bin/bash',
+        'debrebuild',
+        '-c', setup_script_command  # Execute command to set up the custom zgrep inside the container
     ]
 
     # Execute the Docker command
@@ -119,7 +184,9 @@ RUN apt-get update && \
     curl \
     libxml2-dev \
     libxslt1-dev \
-    zlib1g-dev
+    zlib1g-dev \
+    mmdebstrap \
+    zsh
 
 # Set up sudo privileges
 RUN echo 'ALL ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
@@ -148,9 +215,12 @@ COPY . /app
 # Set permissions for the copied files
 RUN chmod -R a+rX /app
 
-# Ensure bash is executable and set as the default shell
-RUN chmod +x /bin/bash
-SHELL ["/bin/bash", "-c"]
+# Ensure zsh is executable and set as the default shell
+RUN chmod +x /bin/zsh
+SHELL ["/bin/zsh", "-c"]
+
+# Entry point
+ENTRYPOINT ["/bin/zsh", "/app/custom_entrypoint.sh"]
 """
 
 def write_dockerfile(dockerfile_content):
@@ -171,7 +241,7 @@ def run_in_docker(command):
         'docker', 'run', '--rm', '-a', 'stdout', '-a', 'stderr',
         '-v', f'{current_directory}:/app',  # Mount the current directory to /app in the container
         '-w', '/app',  # Set working directory to /app
-        '--entrypoint', '/bin/bash',
+        '--entrypoint', '/bin/zsh',
         'debrebuild',
         '-c', command  # Directly run the provided command in the container
     ]
@@ -261,6 +331,7 @@ def run(builder_args):
 
     bootstrap_build_base_system()
     setup_keyrings_in_docker()
+    setup_custom_zgrep_in_docker()
 
     # Use the current directory to store the temporary file
     current_directory = os.getcwd()

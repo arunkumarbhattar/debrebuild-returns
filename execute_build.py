@@ -30,20 +30,20 @@ logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
 
 
 DEBIAN_KEYRINGS = [
-    "/usr/share/keyrings/debian-archive-bullseye-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-bullseye-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-bullseye-stable.gpg",
-    "/usr/share/keyrings/debian-archive-buster-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-buster-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-buster-stable.gpg",
-    "/usr/share/keyrings/debian-archive-keyring.gpg",
-    "/usr/share/keyrings/debian-archive-removed-keys.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-security-automatic.gpg",
-    "/usr/share/keyrings/debian-archive-stretch-stable.gpg",
-    "/usr/share/keyrings/debian-ports-archive-keyring-removed.gpg",
-    "/usr/share/keyrings/debian-ports-archive-keyring.gpg",
-    "/usr/share/keyrings/debian-keyring.gpg",
+    "/app/keyrings/debian-archive-bullseye-automatic.gpg",
+    "/app/keyrings/debian-archive-bullseye-security-automatic.gpg",
+    "/app/keyrings/debian-archive-bullseye-stable.gpg",
+    "/app/keyrings/debian-archive-buster-automatic.gpg",
+    "/app/keyrings/debian-archive-buster-security-automatic.gpg",
+    "/app/keyrings/debian-archive-buster-stable.gpg",
+    "/app/keyrings/debian-archive-keyring.gpg",
+    "/app/keyrings/debian-archive-removed-keys.gpg",
+    "/app/keyrings/debian-archive-stretch-automatic.gpg",
+    "/app/keyrings/debian-archive-stretch-security-automatic.gpg",
+    "/app/keyrings/debian-archive-stretch-stable.gpg",
+    "/app/keyrings/debian-ports-archive-keyring-removed.gpg",
+    "/app/keyrings/debian-ports-archive-keyring.gpg",
+    "/app/keyrings/debian-keyring.gpg",
 ]
 
 
@@ -291,14 +291,36 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     # Copy all files from temp_dir to rebuilder.tmpdir
     subprocess.run(["cp", "-r", temp_dir, rebuilder.tmpdir], check=True)
 
-    if rebuilder.use_docker_image:
-        cmd = [
-            "docker", "run", "-v", f"{output}:/output", rebuilder.use_docker_image,
-            "/bin/bash", "-c",
-            f"cd {temp_dir} && dpkg-source --no-check -x /*.dsc && env {get_env(rebuilder)} dpkg-buildpackage -uc -a {rebuilder.buildinfo.host_arch} --build={build}"
-        ]
-        logging.debug(f"Using Docker image for build: {rebuilder.use_docker_image}")
-        return cmd
+    custom_zgrep_script = """#!/bin/bash
+# Custom zgrep to avoid process substitution issues
+# Usage: zgrep -h -f <pattern_file> <compressed_files...>
+
+if [ "$1" = "-h" ] && [ "$2" = "-f" ]; then
+    pattern_file=$2
+    shift 2
+    tmp_pattern_file=$(mktemp)
+
+    # Read the pattern from the input file descriptor and write it to a temporary file
+    cat "$pattern_file" > "$tmp_pattern_file"
+
+    # Execute the original zgrep with the temporary pattern file
+    /bin/zgrep -h -f "$tmp_pattern_file" "$@"
+
+    # Clean up the temporary file
+    rm -f "$tmp_pattern_file"
+else
+    # Fallback to the original zgrep for other usages
+    /bin/zgrep "$@"
+fi
+"""
+
+    # Save the custom zgrep script to a file
+    script_path = os.path.join(rebuilder.tmpdir, "custom_zgrep.sh")
+    with open(script_path, "w") as script_file:
+        script_file.write(custom_zgrep_script)
+
+    # Make sure the custom script is executable
+    os.chmod(script_path, 0o755)
 
     cmd = [
         "env",
@@ -314,6 +336,9 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         '--aptopt=Acquire::https::Dl-Limit "1000";',
         '--aptopt=Acquire::Retries "5";',
         '--aptopt=APT::Get::allow-downgrades "true";',
+        f'--customize-hook=copy-in {script_path} /custom_zgrep.sh',
+        '--customize-hook=chroot "$1" chmod +x /custom_zgrep.sh',
+        '--customize-hook=chroot "$1" mv /custom_zgrep.sh /usr/local/bin/zgrep'
     ]
 
     logging.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
@@ -329,11 +354,13 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         logging.debug("Added build-essential installation to mmdebstrap command")
 
     cmd += [
-        '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg dirmngr"',
+        '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg dirmngr zsh"',  # Install zsh here
         '--essential-hook=chroot "$1" sh -c "apt-get update && apt-get --yes install -f"',
-        '--essential-hook=chroot "$1" sh -c "apt-get --yes install wget"'
+        '--essential-hook=chroot "$1" sh -c "apt-get --yes install wget"',
+        # Ensure /dev/fd is correctly symlinked to /proc/self/fd
+        '--essential-hook=chroot "$1" sh -c "rm -rf /dev/fd && ln -s /proc/self/fd /dev/fd"'
     ]
-    logging.debug("Added fakeroot, util-linux, gnupg, and wget installation to mmdebstrap command")
+    logging.debug("Added fakeroot, util-linux, gnupg, wget, zsh installation, and /dev/fd symlink fix to mmdebstrap command")
 
     # Add Debian keyrings into mmdebstrap trusted keys after init phase
     cmd += [
@@ -456,7 +483,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     logging.debug("Added apt-key update to mmdebstrap command")
 
     cmd += [
-        '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/bash'
+        '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/zsh'
     ]
     logging.debug("Added creation of builduser to mmdebstrap command")
 
@@ -482,11 +509,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         build = "binary"  # Replace with appropriate build type if needed
         logging.debug("Source is unavailable")
         dsc_url, orig_tar_url, debian_tar_url = fetch_debian_package_urls(rebuilder, rebuilder.buildinfo.source,
-                                                                               rebuilder.buildinfo.version)
-        # dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.dsc"
-        # orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.40.1.orig.tar.gz"
-        # debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/graphviz/graphviz_2.42.2-9.debian.tar.xz"
-
+                                                                          rebuilder.buildinfo.version)
         dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
         orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
         debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
@@ -590,6 +613,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         create_docker_snapshot(rebuilder, cmd)
 
     return cmd
+
 def get_debian_suite(self):
     """Returns the Debian suite suited for debootstraping the build
     environment as described by the .buildinfo file.
