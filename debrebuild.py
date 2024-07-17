@@ -469,9 +469,9 @@ def run_docker_container(output_dir):
         '-v', output_dir_volume,  # Mount the output_dir directory
         '-w', '/app',  # Set working directory to /app
         '--entrypoint', '/bin/bash', 'debrebuild',  # Use bash in the debrebuild image
-        '-c', "touch /app/build_checkpoint/test_file.txt && echo 'Test content' > /app/build_checkpoint/test_file.txt && \
-               touch /app/output_dir/test_file.txt && echo 'Test content' > /app/output_dir/test_file.txt && \
-               ls -l /app/build_checkpoint /app/output_dir"  # Create and list test files
+        '-c', f"touch /app/build_checkpoint/test_file.txt && echo 'Test content' > /app/build_checkpoint/test_file.txt && \
+               touch /app/{output_dir}/test_file.txt && echo 'Test content' > /app/{output_dir}/test_file.txt && \
+               ls -l /app/build_checkpoint /app/{output_dir}"  # Create and list test files
     ]
 
     # Execute the Docker command
