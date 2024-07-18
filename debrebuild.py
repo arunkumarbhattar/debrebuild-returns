@@ -319,17 +319,22 @@ def copy_from_docker(source, destination):
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
 
 
-def run_python_in_docker(command):
+def run_python_in_docker(command, output_dir):
     current_directory = os.getcwd()
     build_checkpoint_path = os.path.join(current_directory, 'build_checkpoint')
+    output_directory_path = os.path.join(build_checkpoint_path, output_dir)
 
-    # Ensure the build_checkpoint directory is mounted
-    volume_mount = f"{build_checkpoint_path}:/app/build_checkpoint"
+    # Ensure both the general build_checkpoint directory and the specific output directory are mounted
+    volume_mounts = [
+        f"{build_checkpoint_path}:/app/build_checkpoint",  # Mount the whole build_checkpoint directory
+        f"{output_directory_path}:/app/build_checkpoint/{output_dir}"  # Mount the specific output directory
+    ]
 
     # Assemble the Docker command with volume mounts
     cmd = [
         'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
-        '-v', volume_mount,  # Mount the build_checkpoint directory to /app/build_checkpoint in the container
+        '-v', volume_mounts[0],  # Mount the general build_checkpoint directory
+        '-v', volume_mounts[1],  # Mount the specific output directory
         '-w', '/app',  # Set working directory to /app inside the container
         '--entrypoint', '/bin/bash', 'debrebuild',  # Using bash and debrebuild as the image name
         '-c', f"python3 {command}"  # Run the specified Python command
@@ -532,14 +537,9 @@ def run(builder_args):
     test_command = "python3 test_httpx_import.py"
     run_in_docker(test_command)
 
-    # # Copy the temp file into /app directory inside the Docker container
-    # copy_to_docker("temp_args.json", "temp_args.json")
-    #
-    # time(5)
-    # Call to run the command in Docker with the file accessible
     json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
     try:
-        run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}")
+        run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}", output_dir)
     except Exception as e:
         print("Error running command in Docker:", e)
         # Assuming debug_docker() is a function you've defined to help with debugging
@@ -559,7 +559,7 @@ def run(builder_args):
 
     try:
         run_python_in_docker(f"execute_build.py"
-                      f" /app/{checkpoint_json_path}")
+                      f" /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to execute build: {e}")
         debug_docker()
@@ -567,7 +567,7 @@ def run(builder_args):
 
     try:
         run_python_in_docker(f"post_build_actions.py"
-                      f" {checkpoint_json_path} {final_output_dir}")
+                      f" /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to perform post-build actions: {e}")
         debug_docker()

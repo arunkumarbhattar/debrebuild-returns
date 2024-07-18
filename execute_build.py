@@ -114,18 +114,34 @@ def mmdebstrap(rebuilder, output):
     # Prepare mmdebstrap command
     cmd = generate_mmdebstrap_cmd(rebuilder, output)
 
-    logging.debug("Final mmdebstrap command: " + " ".join(cmd))
+    logger.debug("Final mmdebstrap command: " + " ".join(cmd))
 
     # Execute the initial mmdebstrap command
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+
+    logger.debug(f"mmdebstrap completed successfully: {result.stdout}")
+    if result.stdout:
+        print("STDOUT:", result.stdout)
+    if result.stderr:
+        print("STDERR:", result.stderr)
 
     if result.returncode != 0:
         # Handle failure in finding the source package or version
-        logging.error(f"mmdebstrap failed with error: {result.stderr}")
+        logger.error(f"mmdebstrap failed with error: {result.stderr}")
         raise RebuilderException("mmdebstrap failed")
     else:
         logger.debug(f"mmdebstrap completed successfully: {result.stdout}")
+        print_output_directory_tree(build_dir)
 
+def print_output_directory_tree(directory):
+    # Helper function to print the directory tree
+    for root, dirs, files in os.walk(directory):
+        level = root.replace(directory, '').count(os.sep)
+        indent = ' ' * 4 * (level)
+        print(f"{indent}{os.path.basename(root)}/")
+        subindent = ' ' * 4 * (level + 1)
+        for f in files:
+            print(f"{subindent}{f}")
 
 def is_source_available(self):
     # Implement the logic to check if the source package and version are available
@@ -265,7 +281,7 @@ def get_sources_list_timestamps(self):
         sources_list += sources
     return sources_list
 
-def generate_mmdebstrap_cmd(rebuilder, output):
+def generate_mmdebstrap_cmd(rebuilder, output_dir):
     # Determine build type
     if rebuilder.buildinfo.build_archany and rebuilder.buildinfo.build_archall:
         build = "any,all"
@@ -278,7 +294,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
     else:
         raise RebuilderException("Cannot determine what to build")
 
-    logging.debug(f"Determined build type: {build}")
+    logger.debug(f"Determined build type: {build}")
 
     checkpoint_files = rebuilder.checkpoint_files
     temp_dir = os.path.join(rebuilder.checkpoint_dir, os.path.basename(rebuilder.tempaptdir))
@@ -307,17 +323,17 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         '--aptopt=APT::Get::allow-downgrades "true";'
     ]
 
-    logging.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
+    logger.debug(f"Initial mmdebstrap command: {' '.join(cmd)}")
 
     if rebuilder.proxy:
         cmd += ['--aptopt=Acquire::http::proxy "{}";'.format(rebuilder.proxy)]
-        logging.debug(f"Added proxy to mmdebstrap command: {rebuilder.proxy}")
+        logger.debug(f"Added proxy to mmdebstrap command: {rebuilder.proxy}")
 
     cmd += ["--keyring=/usr/share/keyrings/"]
 
     if not get_build_dependency(rebuilder, "build-essential"):
         cmd += ['--essential-hook=chroot "$1" sh -c "apt-get --yes install build-essential"']
-        logging.debug("Added build-essential installation to mmdebstrap command")
+        logger.debug("Added build-essential installation to mmdebstrap command")
 
     cmd += [
         '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg dirmngr zsh"',  # Install zsh here
@@ -326,7 +342,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         # Ensure /dev/fd is correctly symlinked to /proc/self/fd
         '--essential-hook=chroot "$1" sh -c "rm -rf /dev/fd && ln -s /proc/self/fd /dev/fd"'
     ]
-    logging.debug("Added fakeroot, util-linux, gnupg, wget, zsh installation, and /dev/fd symlink fix to mmdebstrap command")
+    logger.debug("Added fakeroot, util-linux, gnupg, wget, zsh installation, and /dev/fd symlink fix to mmdebstrap command")
 
     # Add Debian keyrings into mmdebstrap trusted keys after init phase
     cmd += [
@@ -342,13 +358,13 @@ def generate_mmdebstrap_cmd(rebuilder, output):
                 join(rebuilder.extra_repository_keys)
             )
         ]
-        logging.debug("Added extra repository keys to mmdebstrap command")
+        logger.debug("Added extra repository keys to mmdebstrap command")
 
     if rebuilder.extra_repository_files:
         cmd += [
             '--essential-hook=chroot "$1" sh -c "apt-get --yes install apt-transport-https ca-certificates"'
         ]
-        logging.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
+        logger.debug("Added installation of apt-transport-https and ca-certificates to mmdebstrap command")
 
     if rebuilder.consider_local_repo or rebuilder.custom_deb:
         logger.debug("DEBBIE")
@@ -362,7 +378,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
                 lines = f.readlines()
 
             # Debug: Log the original contents of the Packages file
-            logging.debug("Original Packages file contents:\n" + ''.join(lines))
+            logger.debug("Original Packages file contents:\n" + ''.join(lines))
 
             with open(packages_file_src, "w") as f:
                 for line in lines:
@@ -379,21 +395,21 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             # Debug: Verify the updated Packages file contents
             with open(packages_file_src, "r") as f:
                 updated_lines = f.readlines()
-            logging.debug("Updated Packages file contents:\n" + ''.join(updated_lines))
+            logger.debug("Updated Packages file contents:\n" + ''.join(updated_lines))
 
             # Debug: Verify the compressed Packages.gz file contents
             packages_gz_path = packages_file_src + ".gz"
             if os.path.exists(packages_gz_path):
                 with open(packages_gz_path, "rb") as f:
                     compressed_contents = f.read()
-                logging.debug(
+                logger.debug(
                     f"Compressed Packages.gz file contents: {compressed_contents[:200]}... (truncated for brevity)")
             else:
-                logging.error(f"Compressed Packages.gz file does not exist at {packages_gz_path}")
+                logger.error(f"Compressed Packages.gz file does not exist at {packages_gz_path}")
 
-            logging.debug(f"Updated Filename paths in Packages file and recompressed it.")
+            logger.debug(f"Updated Filename paths in Packages file and recompressed it.")
         except Exception as e:
-            logging.error(f"Failed to update the Filename paths in the Packages file: {e}")
+            logger.error(f"Failed to update the Filename paths in the Packages file: {e}")
             return False
 
         cmd += [
@@ -424,7 +440,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             '--essential-hook=chroot "$1" sh -c "apt-get update"',  # Update apt after generating Packages.gz
         ]
 
-        logging.debug("Added local repository setup to mmdebstrap command")
+        logger.debug("Added local repository setup to mmdebstrap command")
 
     else:
         logger.debug("Not DEBBIE")
@@ -446,12 +462,12 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             )
         ]
 
-    logging.debug("Added apt-key update to mmdebstrap command")
+    logger.debug("Added apt-key update to mmdebstrap command")
 
     cmd += [
         '--customize-hook=chroot "$1" useradd --no-create-home -d /nonexistent -p "" builduser -s /bin/zsh'
     ]
-    logging.debug("Added creation of builduser to mmdebstrap command")
+    logger.debug("Added creation of builduser to mmdebstrap command")
 
     # In case of binNMU build, we add the changelog entry from buildinfo
     binnmucmds = []
@@ -473,7 +489,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
         env_vars = " ".join(get_env(rebuilder))
         host_arch = rebuilder.buildinfo.host_arch
         build = "binary"  # Replace with appropriate build type if needed
-        logging.debug("Source is unavailable")
+        logger.debug("Source is unavailable")
         dsc_url, orig_tar_url, debian_tar_url = fetch_debian_package_urls(rebuilder, rebuilder.buildinfo.source,
                                                                           rebuilder.buildinfo.version)
         dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
@@ -482,7 +498,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
 
         if not dsc_url or not orig_tar_url or not debian_tar_url:
             # Prompt the user to provide source URLs for fallback
-            logging.warning("Unable to find URLs automatically, requesting user input.")
+            logger.warning("Unable to find URLs automatically, requesting user input.")
             rebuilder.fallback_dsc_url = input("Please provide the URL for the .dsc file: ")
             rebuilder.fallback_orig_tar_url = input("Please provide the URL for the .orig.tar.gz file: ")
             rebuilder.fallback_debian_tar_url = input("Please provide the URL for the .debian.tar.xz file: ")
@@ -495,16 +511,15 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             logger.debug(f"Original Tar URL: {rebuilder.fallback_orig_tar_url}")
             logger.debug(f"Debian Tar URL: {rebuilder.fallback_debian_tar_url}")
 
+        # Hooks for setting up and downloading packages
         cmd += [
             '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
             '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(dsc_url=rebuilder.fallback_dsc_url),
-            '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(
-                orig_tar_url=rebuilder.fallback_orig_tar_url),
-            '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(
-                debian_tar_url=rebuilder.fallback_debian_tar_url),
-            '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) src_dir"'.format(
-                dsc_url=rebuilder.fallback_dsc_url),
+            '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(orig_tar_url=rebuilder.fallback_orig_tar_url),
+            '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(debian_tar_url=rebuilder.fallback_debian_tar_url),
+            '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) src_dir"'.format(dsc_url=rebuilder.fallback_dsc_url),
             '--customize-hook=chroot "$1" sh -c "chown -R builduser:builduser /build"',
+            '--customize-hook=chroot "$1" sh -c "ls -lR /build/src_dir; echo Listing contents of /build/src_dir"',
             '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(
                 " && ".join([
                     "cd /build/src_dir",
@@ -513,19 +528,19 @@ def generate_mmdebstrap_cmd(rebuilder, output):
             ),
             '--customize-hook=chroot "$1" sh -c "find /build -mindepth 1 -maxdepth 1 ! -name src_dir -exec mv {} /build/src_dir/ \\;"'
         ]
-        logging.debug("Added preparation of build directory and source package download to mmdebstrap command")
 
-        # Revised sync-out command
+        # Sync-out command with post-operation logging
         cmd += [
-            '--customize-hook=sync-out {custom_unpack_dir} {output}'.format(custom_unpack_dir="/build/src_dir",
-                                                                            output=output),
+            '--customize-hook=sync-out {custom_unpack_dir} {output_dir}'.format(custom_unpack_dir="/build/src_dir", output_dir=output_dir),
             rebuilder.buildinfo.get_debian_suite(),
             "/dev/null",
             get_chroot_basemirror(rebuilder),  # Ensure this method is defined and returns a valid URL
+            '--customize-hook=sh -c "ls -lR {output_dir}; echo Listing contents of {output_dir}"'.format(output_dir=output_dir)
         ]
-        logging.debug("Added sync-out and final setup to mmdebstrap command")
+
+        logger.debug("Added sync-out and final setup to mmdebstrap command")
     else:
-        logging.debug("Source is available")
+        logger.debug("Source is available")
         # Prepare build directory and get package source
         cmd += [
             '--customize-hook=chroot "$1" env sh -c "{}"'.format(
@@ -567,7 +582,7 @@ def generate_mmdebstrap_cmd(rebuilder, output):
 
         cmd += [
             "--customize-hook=sync-out {} {}".format(
-                os.path.dirname(quote(get_build_path(rebuilder.buildinfo))), output
+                os.path.dirname(quote(get_build_path(rebuilder.buildinfo))), output_dir
             ),
             get_debian_suite(rebuilder.buildinfo),
             "/dev/null",
@@ -628,7 +643,7 @@ def fetch_debian_package_urls(self, package_name, version):
         response = requests.get(package_url)
         response.raise_for_status()
     except requests.RequestException as e:
-        logging.error(f"Failed to fetch the package page: {e}")
+        logger.error(f"Failed to fetch the package page: {e}")
         return None, None, None
 
     soup = BeautifulSoup(response.text, 'html.parser')
@@ -680,7 +695,7 @@ def create_docker_snapshot(rebuilder, cmd):
     result = subprocess.run(build_cmd, capture_output=True, text=True)
 
     if result.returncode != 0:
-        logging.error(f"Docker build failed with error: {result.stderr}")
+        logger.error(f"Docker build failed with error: {result.stderr}")
         raise RebuilderException("Docker build failed")
     else:
         logger.debug(f"Docker image {image_name} created successfully: {result.stdout}")
@@ -752,12 +767,12 @@ def get_response(rebuilder, url):
 def main():
     import sys
 
-    if len(sys.argv) != 2:
-        logger.debug("Usage: python execute_build.py <rebuilder_json_file>")
+    if len(sys.argv) != 3:
+        logger.debug("Usage: python execute_build.py <rebuilder_json_file> <artifacts_dir>")
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
-
+    artifacts_dir = sys.argv[2]
     # Load the Rebuilder instance from the JSON file
     with open(rebuilder_json_file, 'r') as f:
         rebuilder_data = json.load(f)
@@ -767,7 +782,7 @@ def main():
     # Call the execute_build function with the Rebuilder instance
     builder = "mmdebstrap"  # or get this from some config if needed
 
-    execute_build(rebuilder, builder, rebuilder_data["output_dir"])
+    execute_build(rebuilder, builder, artifacts_dir)
 
 
 if __name__ == "__main__":

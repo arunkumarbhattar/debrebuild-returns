@@ -259,7 +259,7 @@ def main():
         sys.exit(1)
 
     rebuilder_json_file = sys.argv[1]
-    artifacts_dir = sys.argv[1]
+    artifacts_dir = sys.argv[2]
 
     # Load the Rebuilder instance from the JSON file
     with open(rebuilder_json_file, 'r') as f:
