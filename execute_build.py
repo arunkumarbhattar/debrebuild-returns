@@ -16,6 +16,7 @@ from initialize_and_find_dependencies import Rebuilder, RebuilderBuildInfo, Pack
 
 import logging
 import sys
+
 # Configure logging
 logger = logging.getLogger("execute_build")
 logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
@@ -27,7 +28,6 @@ logger.addHandler(console_handler)
 
 logger = logging.getLogger("execute_build")
 logger.setLevel(logging.DEBUG)  # Set logger level to DEBUG
-
 
 DEBIAN_KEYRINGS = [
     "/app/keyrings/debian-archive-bullseye-automatic.gpg",
@@ -57,6 +57,7 @@ class BuildInfoException(Exception):
 
 class RebuilderException(Exception):
     pass
+
 
 class Package:
     def __init__(
@@ -93,6 +94,7 @@ class Package:
     def __repr__(self):
         return f"Package({self.name}, {self.version}, architecture={self.architecture})"
 
+
 def execute_build(rebuilder, builder, output):
     # Execute the build
     logger.debug("Starting the actual rebuild...")
@@ -121,9 +123,9 @@ def mmdebstrap(rebuilder, output):
 
     logger.debug(f"mmdebstrap completed successfully: {result.stdout}")
     if result.stdout:
-        print("STDOUT:", result.stdout)
+        logger.debug("STDOUT:", result.stdout)
     if result.stderr:
-        print("STDERR:", result.stderr)
+        logger.debug("STDERR:", result.stderr)
 
     if result.returncode != 0:
         # Handle failure in finding the source package or version
@@ -133,15 +135,17 @@ def mmdebstrap(rebuilder, output):
         logger.debug(f"mmdebstrap completed successfully: {result.stdout}")
         print_output_directory_tree(build_dir)
 
+
 def print_output_directory_tree(directory):
     # Helper function to print the directory tree
     for root, dirs, files in os.walk(directory):
         level = root.replace(directory, '').count(os.sep)
         indent = ' ' * 4 * (level)
-        print(f"{indent}{os.path.basename(root)}/")
+        logger.debug(f"{indent}{os.path.basename(root)}/")
         subindent = ' ' * 4 * (level + 1)
         for f in files:
-            print(f"{subindent}{f}")
+            logger.debug(f"{subindent}{f}")
+
 
 def is_source_available(self):
     # Implement the logic to check if the source package and version are available
@@ -155,6 +159,7 @@ def is_source_available(self):
     result = subprocess.run(source_check_cmd, capture_output=True, text=True)
     return result.returncode == 0
 
+
 def get_build_depends(self):
     # Storing self.build_depends is needed as we refresh information
     # from apt cache
@@ -166,11 +171,13 @@ def get_build_depends(self):
             self.build_depends.append(Package(name, version))
     return self.build_depends
 
+
 def get_apt_build_depends(rebuilder):
     apt_build_depends = []
     for pkg in get_build_depends(rebuilder.buildinfo):
         apt_build_depends.append(pkg.to_apt_install_format(rebuilder.buildinfo.build_arch))
     return apt_build_depends
+
 
 def get_build_dependency(rebuilder, name):
     build_dependency = None
@@ -179,6 +186,7 @@ def get_build_dependency(rebuilder, name):
             build_dependency = pkg
             break
     return build_dependency
+
 
 def get_src_date(self):
     if all(
@@ -241,6 +249,7 @@ def get_src_date(self):
         self.buildinfo.component_name,
     )
 
+
 def get_sources_list(self):
     sources_list = self.newly_added_sources
     archive_name, source_date, dist, component = get_src_date(self)
@@ -272,6 +281,7 @@ def get_sources_list(self):
 
     return sources_list
 
+
 def get_sources_list_timestamps(self):
     """
     Returns all timestamp inline Debian repositories for all archives
@@ -280,6 +290,7 @@ def get_sources_list_timestamps(self):
     for sources in self.required_timestamp_sources.values():
         sources_list += sources
     return sources_list
+
 
 def generate_mmdebstrap_cmd(rebuilder, output_dir):
     # Determine build type
@@ -336,13 +347,15 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
         logger.debug("Added build-essential installation to mmdebstrap command")
 
     cmd += [
-        '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg dirmngr zsh"',  # Install zsh here
+        '--essential-hook=chroot "$1" sh -c "apt-get --yes install fakeroot util-linux gnupg dirmngr zsh"',
+        # Install zsh here
         '--essential-hook=chroot "$1" sh -c "apt-get update && apt-get --yes install -f"',
         '--essential-hook=chroot "$1" sh -c "apt-get --yes install wget"',
         # Ensure /dev/fd is correctly symlinked to /proc/self/fd
         '--essential-hook=chroot "$1" sh -c "rm -rf /dev/fd && ln -s /proc/self/fd /dev/fd"'
     ]
-    logger.debug("Added fakeroot, util-linux, gnupg, wget, zsh installation, and /dev/fd symlink fix to mmdebstrap command")
+    logger.debug(
+        "Added fakeroot, util-linux, gnupg, wget, zsh installation, and /dev/fd symlink fix to mmdebstrap command")
 
     # Add Debian keyrings into mmdebstrap trusted keys after init phase
     cmd += [
@@ -434,7 +447,8 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
             '--essential-hook=ls /app/build_checkpoint/tmp/local_repo',  # Verify the contents of the source directory
             '--essential-hook=cp -r /app/build_checkpoint/tmp/local_repo/* "$1"/mnt/local_repo/',
             '--essential-hook=ls "$1"/mnt/local_repo',  # Verify the contents of the target directory after copying
-            '--essential-hook=chroot "$1" sh -c "echo \'\ndeb [trusted=yes] file:///mnt/local_repo ./\' >> /etc/apt/sources.list"',
+            '--essential-hook=chroot "$1" sh -c "echo \'\ndeb [trusted=yes] file:///mnt/local_repo ./\' >> '
+            '/etc/apt/sources.list"',
             '--essential-hook=chroot "$1" sh -c "cd /mnt/local_repo && dpkg-scanpackages . | gzip -c > Packages.gz"',
             # Generate Packages.gz
             '--essential-hook=chroot "$1" sh -c "apt-get update"',  # Update apt after generating Packages.gz
@@ -514,10 +528,14 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
         # Hooks for setting up and downloading packages
         cmd += [
             '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
-            '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(dsc_url=rebuilder.fallback_dsc_url),
-            '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(orig_tar_url=rebuilder.fallback_orig_tar_url),
-            '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(debian_tar_url=rebuilder.fallback_debian_tar_url),
-            '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) src_dir"'.format(dsc_url=rebuilder.fallback_dsc_url),
+            '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(
+                dsc_url=rebuilder.fallback_dsc_url),
+            '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(
+                orig_tar_url=rebuilder.fallback_orig_tar_url),
+            '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(
+                debian_tar_url=rebuilder.fallback_debian_tar_url),
+            '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) '
+            'src_dir"'.format(dsc_url=rebuilder.fallback_dsc_url),
             '--customize-hook=chroot "$1" sh -c "chown -R builduser:builduser /build"',
             '--customize-hook=chroot "$1" sh -c "ls -lR /build/src_dir; echo Listing contents of /build/src_dir"',
             '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(
@@ -526,16 +544,19 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
                     "env {} dpkg-buildpackage -uc -d -a {} --build={}".format(env_vars, host_arch, build)
                 ])
             ),
-            '--customize-hook=chroot "$1" sh -c "find /build -mindepth 1 -maxdepth 1 ! -name src_dir -exec mv {} /build/src_dir/ \\;"'
+            '--customize-hook=chroot "$1" sh -c "find /build -mindepth 1 -maxdepth 1 ! -name src_dir -exec mv {} '
+            '/build/src_dir/ \\;"'
         ]
 
         # Sync-out command with post-operation logging
         cmd += [
-            '--customize-hook=sync-out {custom_unpack_dir} {output_dir}'.format(custom_unpack_dir="/build/src_dir", output_dir=output_dir),
+            '--customize-hook=sync-out {custom_unpack_dir} {output_dir}'.format(custom_unpack_dir="/build/src_dir",
+                                                                                output_dir=output_dir),
             rebuilder.buildinfo.get_debian_suite(),
             "/dev/null",
             get_chroot_basemirror(rebuilder),  # Ensure this method is defined and returns a valid URL
-            '--customize-hook=sh -c "ls -lR {output_dir}; echo Listing contents of {output_dir}"'.format(output_dir=output_dir)
+            '--customize-hook=sh -c "ls -lR {output_dir}; echo Listing contents of {output_dir}"'.format(
+                output_dir=output_dir)
         ]
 
         logger.debug("Added sync-out and final setup to mmdebstrap command")
@@ -594,6 +615,7 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
 
     return cmd
 
+
 def get_debian_suite(self):
     """Returns the Debian suite suited for debootstraping the build
     environment as described by the .buildinfo file.
@@ -616,11 +638,13 @@ def get_debian_suite(self):
                     break
     return debian_suite
 
+
 def get_build_path(self):
     if not self.build_path:
         self.build_path = f"/build/{self.source}-{rstr.letters(10)}"
     self.build_path = self.build_path.replace("~", "-")
     return self.build_path
+
 
 def get_env(self):
     env = []
@@ -629,6 +653,7 @@ def get_env(self):
     if self.build_options_nocheck:
         env.append("DEB_BUILD_OPTIONS=nocheck")
     return env
+
 
 def fetch_debian_package_urls(self, package_name, version):
     base_url = "http://ftp.de.debian.org/debian/pool/main/"
@@ -662,6 +687,7 @@ def fetch_debian_package_urls(self, package_name, version):
 
     return dsc_url, orig_tar_url, debian_tar_url
 
+
 def get_base_image(c):
     with open('/etc/os-release') as f:
         lines = f.readlines()
@@ -676,6 +702,7 @@ def get_base_image(c):
         raise RebuilderException("Unable to determine Debian version from /etc/os-release")
 
     return f"debian:{version}-slim"
+
 
 def create_docker_snapshot(rebuilder, cmd):
     base_image = get_base_image(rebuilder)  # Determine the base Debian image from the current system
@@ -753,6 +780,7 @@ def get_chroot_basemirror(rebuilder):
     logger.error("Cannot determine base mirror to use")
     raise RebuilderException("Cannot determine base mirror to use")
 
+
 def get_response(rebuilder, url):
     try:
         resp = rebuilder.session.get(url)
@@ -763,6 +791,7 @@ def get_response(rebuilder, url):
         resp.status_code = 503
         resp.reason = str(e)
     return resp
+
 
 def main():
     import sys

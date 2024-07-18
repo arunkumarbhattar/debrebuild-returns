@@ -698,12 +698,14 @@ class Rebuilder:
 
         return True
 
+
 def add_checkpoint_file(self, file_path, description):
     relative_path = os.path.relpath(file_path, self.checkpoint_dir)
     self.checkpoint_files.append({
         "path": relative_path,
         "description": description
     })
+
 
 def bootstrap_build_base_system(rebuilder):
     logger.debug("Starting the bootstrap build base system process")
@@ -726,6 +728,7 @@ def bootstrap_build_base_system(rebuilder):
 
     # Step 4: Clean up and create a checkpoint of the build state
     cleanup_and_create_checkpoint(rebuilder)
+
 
 def pre_checks_for_keyrings():
     # Define the path to the keyrings directory inside the Docker container
@@ -782,6 +785,7 @@ def cleanup_and_create_checkpoint(rebuilder):
         logger.debug(f"Rebuilder state saved to {rebuilder.builder_json_file}")
         logger.debug(f"Rebuilder Buildinfo state saved to {rebuilder.buildinfo_pickle_file}")
 
+
 def determine_build_architecture(rebuilder):
     logger.debug("Determining build architecture...")
     if rebuilder.buildinfo.architecture:
@@ -797,6 +801,7 @@ def determine_build_architecture(rebuilder):
         logger.error("Failed to determine what to build.")
         raise RebuilderException("Nothing to build")
     return build_arch
+
 
 def find_build_dependencies(rebuilder):
     # Prepare APT cache for finding dependencies
@@ -1244,12 +1249,9 @@ def get_sources_list_from_timestamp(self):
 if __name__ == "__main__":
     builder_json_file = sys.argv[1]
 
-    print("builder json file path is {builder_json_file}")
     # Load the builder arguments from the JSON file
     with open(builder_json_file, 'r') as f:
         builder_args = json.load(f)
-
-    print("Updated builder arguments:", builder_args)
 
     # Create the Rebuilder instance using the arguments dictionary
     rebuilder = Rebuilder(
