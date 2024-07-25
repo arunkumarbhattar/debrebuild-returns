@@ -504,38 +504,37 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
         host_arch = rebuilder.buildinfo.host_arch
         build = "binary"  # Replace with appropriate build type if needed
         logger.debug("Source is unavailable")
-        dsc_url, orig_tar_url, debian_tar_url = fetch_debian_package_urls(rebuilder, rebuilder.buildinfo.source,
+
+        # dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
+        # orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
+        # debian_tar_url = "http://ftp.de.debian.org/debian/pool/main /g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
+
+        if not rebuilder.dsc_url and not rebuilder.debian_tar_url and not rebuilder.orig_tar_url:
+            dsc_url, orig_tar_url, debian_tar_url = fetch_debian_package_urls(rebuilder, rebuilder.buildinfo.source,
                                                                           rebuilder.buildinfo.version)
-        dsc_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.dsc"
-        orig_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10.orig.tar.gz"
-        debian_tar_url = "http://ftp.de.debian.org/debian/pool/main/g/gzip/gzip_1.10-4+deb11u1.debian.tar.xz"
 
-        if not dsc_url or not orig_tar_url or not debian_tar_url:
-            # Prompt the user to provide source URLs for fallback
-            logger.warning("Unable to find URLs automatically, requesting user input.")
-            rebuilder.fallback_dsc_url = input("Please provide the URL for the .dsc file: ")
-            rebuilder.fallback_orig_tar_url = input("Please provide the URL for the .orig.tar.gz file: ")
-            rebuilder.fallback_debian_tar_url = input("Please provide the URL for the .debian.tar.xz file: ")
-        else:
-            rebuilder.fallback_dsc_url = dsc_url
-            rebuilder.fallback_orig_tar_url = orig_tar_url
-            rebuilder.fallback_debian_tar_url = debian_tar_url
-
-            logger.debug(f"DSC URL: {rebuilder.fallback_dsc_url}")
-            logger.debug(f"Original Tar URL: {rebuilder.fallback_orig_tar_url}")
-            logger.debug(f"Debian Tar URL: {rebuilder.fallback_debian_tar_url}")
+            if not dsc_url or not orig_tar_url or not debian_tar_url:
+                # Prompt the user to provide source URLs for fallback
+                logger.error(f"Unable to find URLs automatically, "
+                             f"Please provide source package information "
+                             f"(--dsc_url, --orig_tar_url, --debian_tar_url) arguments and re-run.")
+                return False
+            else:
+                rebuilder.dsc_url = dsc_url
+                rebuilder.orig_tar_url = orig_tar_url
+                rebuilder.debian_tar_url = debian_tar_url
 
         # Hooks for setting up and downloading packages
         cmd += [
             '--customize-hook=chroot "$1" sh -c "mkdir -p /build"',
             '--customize-hook=chroot "$1" env sh -c "wget -P /build {dsc_url}"'.format(
-                dsc_url=rebuilder.fallback_dsc_url),
+                dsc_url=rebuilder.dsc_url),
             '--customize-hook=chroot "$1" env sh -c "wget -P /build {orig_tar_url}"'.format(
-                orig_tar_url=rebuilder.fallback_orig_tar_url),
+                orig_tar_url=rebuilder.orig_tar_url),
             '--customize-hook=chroot "$1" env sh -c "wget -P /build {debian_tar_url}"'.format(
-                debian_tar_url=rebuilder.fallback_debian_tar_url),
+                debian_tar_url=rebuilder.debian_tar_url),
             '--customize-hook=chroot "$1" env sh -c "cd /build && dpkg-source --no-check -x $(basename {dsc_url}) '
-            'src_dir"'.format(dsc_url=rebuilder.fallback_dsc_url),
+            'src_dir"'.format(dsc_url=rebuilder.dsc_url),
             '--customize-hook=chroot "$1" sh -c "chown -R builduser:builduser /build"',
             '--customize-hook=chroot "$1" sh -c "ls -lR /build/src_dir; echo Listing contents of /build/src_dir"',
             '--customize-hook=chroot "$1" env --unset=TMPDIR runuser builduser -c "{}"'.format(

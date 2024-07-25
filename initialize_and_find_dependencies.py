@@ -253,7 +253,7 @@ class Rebuilder:
                  extra_repository_files=None,
                  extra_repository_keys=None, gpg_sign_keyid=None, gpg_verify=False, gpg_verify_key=None, proxy=None,
                  use_metasnap=False, metasnap_url="http://snapshot.notset.fr", build_options_nocheck=False,
-                 custom_package=None, output_dir=""):
+                 custom_package=None, output_dir="", dsc_url="", orig_tar_url="", debian_tar_url=""):
         self.custom_deb = custom_deb
         self.rebuilder_buildinfo_metadata_path = None
         self.builder_json_file = builder_json_file
@@ -263,7 +263,6 @@ class Rebuilder:
         self.consider_local_repo = False
         self.create_docker_image = None
         self.use_docker_image = None
-        self.fallback_dsc_url = None
         self.buildinfo = None
         self.snapshot_url = snapshot_url
         self.base_mirror = f"{snapshot_mirror}/"
@@ -288,6 +287,9 @@ class Rebuilder:
         self.updated_packages = {}
         self.newly_added_sources = []
         self.output_dir = output_dir
+        self.dsc_url = dsc_url
+        self.orig_tar_url = orig_tar_url
+        self.debian_tar_url = debian_tar_url
 
         logger.debug(f"Input buildinfo: {buildinfo_file}")
 
@@ -346,7 +348,10 @@ class Rebuilder:
             "rebuilder_buildinfo_metadata_path": self.rebuilder_buildinfo_metadata_path,
             "buildinfo_pickle_file": self.buildinfo_pickle_file,
             "custom_deb": self.custom_deb,
-            "output_dir": self.output_dir
+            "output_dir": self.output_dir,
+            "dsc_url": self.dsc_url,
+            "orig_tar_url": self.orig_tar_url,
+            "debian_tar_url": self.debian_tar_url,
         }
 
     @staticmethod
@@ -380,7 +385,10 @@ class Rebuilder:
             metasnap_url=data["metasnap_url"],
             build_options_nocheck=data["build_options_nocheck"],
             custom_package=data["custom_package"],
-            output_dir=data["output_dir"]
+            output_dir=data["output_dir"],
+            dsc_url=data["dsc_url"],
+            orig_tar_url=data["orig_tar_url"],
+            debian_tar_url=data["debian_tar_url"]
         )
         instance.tempaptdir = data["tempaptdir"]
         instance.required_timestamp_sources = data["required_timestamp_sources"]
@@ -1269,7 +1277,10 @@ if __name__ == "__main__":
         use_metasnap=builder_args["use_metasnap"],
         metasnap_url=builder_args["metasnap_url"],
         build_options_nocheck=builder_args["build_options_nocheck"],
-        output_dir=builder_args["output_dir"]
+        output_dir=builder_args["output_dir"],
+        dsc_url=builder_args["dsc_url"],
+        orig_tar_url=builder_args["orig_tar_url"],
+        debian_tar_url=builder_args["debian_tar_url"]
     )
 
     bootstrap_build_base_system(rebuilder)

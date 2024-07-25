@@ -5,8 +5,10 @@ import os
 import shutil
 import subprocess
 import sys
-
+from datetime import datetime
+from bs4 import BeautifulSoup
 import debian.deb822
+import requests
 
 # Configure logging
 logger = logging.getLogger("debrebuild")
@@ -418,6 +420,11 @@ def create_persistent_json_file(builder_args):
     current_directory = os.getcwd()
     json_file_path = os.path.join(current_directory, "persistent_args.json")
 
+    # Remove the existing persistent_args.json file if it exists
+    if os.path.exists(json_file_path):
+        os.remove(json_file_path)
+        logger.debug(f"Removed existing file: {json_file_path}")
+
     # Create a JSON file with example data in the current directory
     with open(json_file_path, 'w') as jf:
         json.dump(builder_args, jf)
@@ -428,44 +435,115 @@ def create_persistent_json_file(builder_args):
         file_contents = json.load(jf)
         logger.debug("Contents of the persistent JSON file:")
         logger.debug(json.dumps(file_contents, indent=4))
+def run_shell_command(command):
+    result = subprocess.run(command, shell=True, capture_output=True)
+    if result.returncode != 0:
+        logger.error(f"Command failed with error: {result.stderr.decode().strip()}")
+        raise subprocess.CalledProcessError(result.returncode, command)
 
+def ignore_errors(func, path, exc_info):
+    logger.warning(f"Ignoring error: {exc_info} for path: {path}")
+
+def archive_and_cleanup_checkpoint(checkpoint_dir):
+    # Create the archive directory and timestamped subdirectory
+    archive_dir = os.path.join(os.getcwd(), "archive")
+    if not os.path.exists(archive_dir):
+        os.makedirs(archive_dir)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timestamped_dir = os.path.join(archive_dir, timestamp)
+
+    # Ensure the timestamped directory does not exist
+    if not os.path.exists(timestamped_dir):
+        os.makedirs(timestamped_dir)
+    else:
+        logger.error(f"Timestamped directory already exists: {timestamped_dir}")
+        raise FileExistsError(f"Timestamped directory already exists: {timestamped_dir}")
+
+    # Copy the contents of the build_checkpoint directory to the timestamped directory
+    try:
+        shutil.copytree(checkpoint_dir, timestamped_dir, dirs_exist_ok=True, ignore_dangling_symlinks=True)
+    except shutil.Error as e:
+        logger.warning(f"Encountered errors during copytree: {e}")
+        for src, dst, error in e.args[0]:
+            logger.warning(f"Error copying {src} to {dst}: {error}")
+            if isinstance(error, FileNotFoundError):
+                continue
+            else:
+                raise
+
+    # Remove the build_checkpoint directory
+    try:
+        shutil.rmtree(checkpoint_dir, onerror=ignore_errors)
+    except PermissionError as e:
+        logger.warning(f"PermissionError: {e}. Trying with sudo.")
+        run_shell_command(f"sudo rm -rf {checkpoint_dir}")
+
+    logger.debug("Build checkpoint archived and removed successfully.")
 
 def run(builder_args):
     logger.debug("Starting the run function")
 
-    bootstrap_build_base_system()
-    setup_keyrings_in_docker()
-
-    # List of packages to install
-    packages = [
-        'requests', 'beautifulsoup4', 'python-debian', 'python-dateutil', 'rstr', 'google-auth', 'httpx', 'tenacity'
-    ]
-
-    # Construct the command to create a virtual environment and install the packages
-    venv_command = (
-        "apt-get update && apt-get install -y python3-pip python3-venv && "
-        "python3 -m venv /app/venv && "
-        f"/app/venv/bin/pip install {' '.join(packages)}"
-    )
+    continue_from_checkpoint = builder_args.get("continue_from_checkpoint")
     output_dir = builder_args["output_dir"]
-    # Run the virtual environment creation and package installation command in the Docker container
-    run_in_docker(venv_command)
 
-    #run_docker_container(output_dir)
-    create_persistent_json_file(builder_args)
 
-    test_command = "python3 test_httpx_import.py"
-    run_in_docker(test_command)
+    buildinfo_file_path = builder_args["buildinfo_file"]
+    with open(buildinfo_file_path) as fd:
+        parsed_info = debian.deb822.BuildInfo(fd)
 
-    json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
-    try:
-        run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}", output_dir)
-    except Exception as e:
-        logger.error("Error running command in Docker:", e)
-        debug_docker()
-        raise RebuilderException("Failed to initialize and find dependencies")
+    source, source_version = parsed_info.get_source()
 
-    output_dir = builder_args["output_dir"]
+    version = parsed_info["version"]
+
+    if is_source_package_info_required(builder_args, source, version):
+        logger.error(f"Unable to find URLs automatically, "
+                     f"Please provide source package information "
+                     f"(--dsc_url, --orig_tar_url, --debian_tar_url) arguments and re-run.")
+        return False
+
+    if continue_from_checkpoint:
+        build_checkpoint_dir = "build_checkpoint"
+        logger.debug(f"Continuing from checkpoint: {continue_from_checkpoint}")
+
+        if os.path.exists(build_checkpoint_dir):
+            shutil.rmtree(build_checkpoint_dir)
+
+        shutil.copytree(continue_from_checkpoint, build_checkpoint_dir, dirs_exist_ok=True, ignore_dangling_symlinks=True)
+        logger.debug("Checkpoint copied to build_checkpoint directory")
+
+    if not continue_from_checkpoint:
+        bootstrap_build_base_system()
+        setup_keyrings_in_docker()
+
+        # List of packages to install
+        packages = [
+            'requests', 'beautifulsoup4', 'python-debian', 'python-dateutil', 'rstr', 'google-auth', 'httpx', 'tenacity'
+        ]
+
+        # Construct the command to create a virtual environment and install the packages
+        venv_command = (
+            "apt-get update && apt-get install -y python3-pip python3-venv && "
+            "python3 -m venv /app/venv && "
+            f"/app/venv/bin/pip install {' '.join(packages)}"
+        )
+
+        # Run the virtual environment creation and package installation command in the Docker container
+        run_in_docker(venv_command)
+
+        create_persistent_json_file(builder_args)
+
+        test_command = "python3 test_httpx_import.py"
+        run_in_docker(test_command)
+
+        json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
+        try:
+            run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}", output_dir)
+        except Exception as e:
+            logger.error("Error running command in Docker:", e)
+            debug_docker()
+            raise RebuilderException("Failed to initialize and find dependencies")
+
     source_name = get_source_name_from_buildinfo(builder_args["buildinfo_file"])
     checkpoint_dir = os.path.join("build_checkpoint", source_name)
     final_output_dir = os.path.join(checkpoint_dir, output_dir)
@@ -475,17 +553,18 @@ def run(builder_args):
     checkpoint_file = f"checkpoint_find_dep_{source_name}.json"
     checkpoint_json_path = os.path.join(checkpoint_dir, checkpoint_file)
 
+    # if continue_from_checkpoint is not empty (it is set to a directory path (say archive/202428)
+    # create a new directory build_checkpoint and copy all the contents from the above directory into this directory
+    # and then continue
     try:
-        run_python_in_docker(f"execute_build.py"
-                             f" /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
+        run_python_in_docker(f"execute_build.py /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to execute build: {e}")
         debug_docker()
         raise RebuilderException("Failed to execute build")
 
     try:
-        run_python_in_docker(f"post_build_actions.py"
-                             f" /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
+        run_python_in_docker(f"post_build_actions.py /app/{checkpoint_json_path} /app/{final_output_dir}", output_dir)
     except subprocess.CalledProcessError as e:
         logger.error(f"Failed to perform post-build actions: {e}")
         debug_docker()
@@ -493,6 +572,9 @@ def run(builder_args):
 
     logger.debug("Post-build actions completed successfully.")
 
+    if not continue_from_checkpoint:
+        # Archive and clean up the build checkpoint directory
+        archive_and_cleanup_checkpoint("build_checkpoint")
 
 def get_args():
     parser = argparse.ArgumentParser(
@@ -528,12 +610,83 @@ def get_args():
     parser.add_argument("--custom-deb", help="List of paths to custom .deb files to include in the build",
                         action="append")
     parser.add_argument("--build_env", help="Path to a custom Dockerfile to use for the build environment")
-    return parser.parse_args()
+    parser.add_argument("--continue-from-checkpoint", help="Directory path to continue from a previous checkpoint")
+    parser.add_argument("--dsc_url", help="URL for the .dsc file", default="")
+    parser.add_argument("--orig_tar_url", help="URL for the original tarball", default="")
+    parser.add_argument("--debian_tar_url", help="URL for the Debian tarball", default="")
 
+    return parser.parse_args()
 
 def realpath(path):
     return os.path.abspath(os.path.expanduser(path))
 
+def is_source_available(source, source_version):
+    """
+    Check if the source package and version are available.
+    """
+    source_check_cmd = [
+        "apt-get",
+        "source",
+        "--only-source",
+        "-d",
+        "{}={}".format(source, source_version)
+    ]
+    result = subprocess.run(source_check_cmd, capture_output=True, text=True)
+    return result.returncode == 0
+
+def fetch_debian_package_urls(package_name, version):
+    print(f"package name is {package_name}")
+    print(f"version name is {version}")
+    base_url = "http://ftp.de.debian.org/debian/pool/main/"
+    if package_name.startswith("lib"):
+        package_url = f"{base_url}{package_name[:4]}/{package_name}/"
+    else:
+        package_url = f"{base_url}{package_name[0]}/{package_name}/"
+
+    logger.debug(f"fetch_debian_package_urls has {package_url}")
+
+    try:
+        response = requests.get(package_url)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        logger.error(f"Failed to fetch the package page: {e}")
+        return None, None, None
+
+    soup = BeautifulSoup(response.text, 'html.parser')
+    dsc_url = None
+    orig_tar_url = None
+    debian_tar_url = None
+
+    for link in soup.find_all('a'):
+        href = link.get('href')
+        if href and href.endswith(f"{version}.dsc"):
+            dsc_url = f"{package_url}{href}"
+        elif href and href.endswith(".orig.tar.gz") and version.split('-')[0] in href:
+            orig_tar_url = f"{package_url}{href}"
+        elif href and href.endswith(f"{version}.debian.tar.xz"):
+            debian_tar_url = f"{package_url}{href}"
+
+    return dsc_url, orig_tar_url, debian_tar_url
+
+def is_source_package_info_required(builder_args, source, source_version):
+    """
+    Check if the source is available, fetch it if not, and handle errors if fetching fails.
+    """
+    if not is_source_available(source, source_version):
+        logger.debug("Source is unavailable")
+
+        if not builder_args["dsc_url"] and not builder_args["debian_tar_url"] and not builder_args["orig_tar_url"]:
+            dsc_url, orig_tar_url, debian_tar_url = fetch_debian_package_urls(source, source_version)
+
+            if not dsc_url or not orig_tar_url or not debian_tar_url:
+                logger.error(
+                    "Unable to find URLs automatically. "
+                    "Please provide source package information "
+                    "(--dsc_url, --orig_tar_url, --debian_tar_url) arguments and re-run."
+                )
+                return True
+        return False
+    return False
 
 def main():
     args = get_args()
@@ -587,6 +740,10 @@ def main():
             "builder_json_file": args.builder_json_file,
             "output_dir": args.output,
             "custom_deb": args.custom_deb,
+            "continue_from_checkpoint": args.continue_from_checkpoint,
+            "dsc_url": args.dsc_url,
+            "orig_tar_url": args.orig_tar_url,
+            "debian_tar_url": args.debian_tar_url,
         }
 
         if args.build_env:
