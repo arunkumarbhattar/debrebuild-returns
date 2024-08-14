@@ -430,12 +430,7 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
                 " && ".join(
                     [
                         "rm /etc/apt/sources.list",
-                        "echo '{}' >> /etc/apt/sources.list".format(
-                            "\n".join(
-                                get_sources_list(rebuilder)
-                                + get_sources_list_timestamps(rebuilder)
-                            )
-                        ),
+                        "echo 'deb [trusted=yes] http://localhost:5000 ./' >> /etc/apt/sources.list",
                     ]
                 )
             )
@@ -464,12 +459,7 @@ def generate_mmdebstrap_cmd(rebuilder, output_dir):
                 " && ".join(
                     [
                         "rm /etc/apt/sources.list",
-                        "echo '{}' >> /etc/apt/sources.list".format(
-                            "\n".join(
-                                get_sources_list(rebuilder)
-                                + get_sources_list_timestamps(rebuilder)
-                            )
-                        ),
+                        "echo 'deb [trusted=yes] http://localhost:5000 ./' >> /etc/apt/sources.list",
                         "apt-get update",
                     ]
                 )

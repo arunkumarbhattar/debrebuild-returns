@@ -5,10 +5,15 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
+
 from bs4 import BeautifulSoup
 import debian.deb822
 import requests
+from flask import jsonify
+
+import package_repo_api
 
 # Configure logging
 logger = logging.getLogger("debrebuild")
@@ -106,7 +111,7 @@ class RebuilderChecksumsError(Exception):
 
 
 DEFAULT_DOCKERFILE_CONTENT = """
-FROM debian:stable
+FROM debian:stable-slim
 
 # Install necessary system packages
 RUN apt-get update && \
@@ -149,7 +154,7 @@ ENV PYTHONPATH="/usr/lib/python3/dist-packages:$PYTHONPATH"
 RUN /app/venv/bin/pip install --upgrade pip
 
 # Install necessary Python libraries using the virtual environment’s pip
-RUN /app/venv/bin/pip install requests beautifulsoup4 python-debian python-dateutil rstr google-auth httpx tenacity
+RUN /app/venv/bin/pip install requests beautifulsoup4 python-debian python-dateutil rstr google-auth httpx tenacity flask
 
 # Copy all application files
 COPY . /app
@@ -268,11 +273,13 @@ def run_python_in_docker(command, artifacts_dir):
     current_directory = os.getcwd()
     build_checkpoint_path = os.path.join(current_directory, 'build_checkpoint')
     output_directory_path = os.path.join(build_checkpoint_path, artifacts_dir)
+    package_repo_path = "/home/arun/Desktop/other/package_repo"  # Adjust this path as needed
 
     # Ensure both the general build_checkpoint directory and the specific output directory are mounted
     volume_mounts = [
         f"{build_checkpoint_path}:/app/build_checkpoint",  # Mount the whole build_checkpoint directory
-        f"{output_directory_path}:/app/build_checkpoint/{artifacts_dir}"  # Mount the specific artifacts directory
+        f"{output_directory_path}:/app/build_checkpoint/{artifacts_dir}",  # Mount the specific artifacts directory
+        f"{package_repo_path}:/app/package_repo"  # Mount the package repository directory inside the container
     ]
 
     # Assemble the Docker command with volume mounts
@@ -280,6 +287,7 @@ def run_python_in_docker(command, artifacts_dir):
         'docker', 'run', '--rm', '--privileged', '-a', 'stdout', '-a', 'stderr',
         '-v', volume_mounts[0],  # Mount the general build_checkpoint directory
         '-v', volume_mounts[1],  # Mount the specific output directory
+        '-v', volume_mounts[2],  # Mount the package repository directory
         '-w', '/app',  # Set working directory to /app inside the container
         '--entrypoint', '/bin/bash', 'debrebuild',  # Using bash and debrebuild as the image name
         '-c', f"python3 {command}"  # Run the specified Python command
@@ -295,7 +303,6 @@ def run_python_in_docker(command, artifacts_dir):
     if result.returncode != 0:
         print(f"Command failed with exit code {result.returncode}")
         raise subprocess.CalledProcessError(result.returncode, cmd, output=result.stdout, stderr=result.stderr)
-
 
 def debug_docker():
     logger.debug("Starting Docker container in interactive mode for debugging...")
@@ -326,18 +333,27 @@ def initialize_configurations():
 
 
 def initialize_configurations_in_docker():
-    # Commands to set environment variables inside Docker
     command = "export APT_CACHE_DIR=/app/temp_apt_cache && export CHROOT_ENV=/app/chroot_env && echo $APT_CACHE_DIR && echo $CHROOT_ENV"
-
-    # Run the command inside Docker
     run_in_docker(command)
 
 
 def install_core_dependencies():
-    subprocess.run(['sudo', 'apt-get', 'update'], check=True)
-    subprocess.run(['sudo', 'apt-get', 'install', '-y', 'debootstrap', 'schroot'], check=True)
-    logger.debug("Core dependencies installed.")
+    max_retries = 10
+    delay = 5  # seconds
 
+    for attempt in range(max_retries):
+        try:
+            result = subprocess.run(['sudo', 'apt-get', 'update'], check=True, capture_output=True, text=True)
+            break
+        except subprocess.CalledProcessError as e:
+            stderr_output = e.stderr if e.stderr else ""
+            if "E: Unable to lock directory /var/lib/apt/lists/" in stderr_output:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries}: APT lock is held, retrying in {delay} seconds...")
+                time.sleep(delay)
+            else:
+                raise e
+    else:
+        raise RebuilderException("Failed to acquire APT lock after multiple attempts")
 
 def prepare_execution_environment():
     chroot_env = os.environ['CHROOT_ENV']

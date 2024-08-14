@@ -18,7 +18,10 @@ import apt_pkg
 from bs4 import BeautifulSoup
 import debian.deb822
 from dateutil.parser import parse as parsedate
-from rstr import rstr
+import requests
+
+import package_repo_api
+from package_repo_api import add_package_to_local_repo, start_api_server
 
 from lib.openpgp import OpenPGPException, OpenPGPEnvironment
 import logging
@@ -57,6 +60,76 @@ class BuildInfoException(Exception):
 
 class RebuilderException(Exception):
     pass
+
+
+from multiprocessing import Process
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+
+@app.route('/health', methods=['GET'])
+def health_check():
+    return jsonify({"status": "healthy"}), 200
+
+
+def run_server():
+    app.run(debug=True, host='0.0.0.0', port=5000, threaded=True)
+
+
+REPO_PATH = "/app/package_repo"
+
+
+@app.route('/list_packages', methods=['GET'])
+def list_packages():
+    packages = []
+
+    if not os.path.exists(REPO_PATH):
+        return jsonify({"error": f"Directory not found: {REPO_PATH}"}), 404
+
+    for item in os.listdir(REPO_PATH):
+        if item.endswith('.deb'):
+            packages.append(item)
+
+    pool_dir = os.path.join(REPO_PATH, 'pool')
+    if os.path.exists(pool_dir):
+        for root, dirs, files in os.walk(pool_dir):
+            for file in files:
+                if file.endswith('.deb'):
+                    packages.append(os.path.join(root, file).replace(REPO_PATH + '/', ''))
+
+    if packages:
+        return jsonify({"packages": packages}), 200
+    else:
+        return jsonify({"error": "No packages found"}), 404
+
+
+def test_api_server():
+    process = Process(target=run_server)
+    process.start()
+
+    # Wait for the server to start by checking the health endpoint
+    max_retries = 10
+    for attempt in range(max_retries):
+        try:
+            response = requests.get('http://localhost:5000/health')
+            if response.status_code == 200:
+                logger.debug("Local API server is running.")
+                package_response = requests.get('http://localhost:5000/list_packages')
+                if package_response.status_code == 200:
+                    packages = package_response.json().get('packages', [])
+                    logger.debug(f"Current packages in the repository: {packages}")
+                else:
+                    logger.error("Failed to retrieve package list.")
+                break
+        except requests.ConnectionError:
+            logger.warning(f"Attempt {attempt + 1}/{max_retries}: Local API server is not available, retrying...")
+            time.sleep(5)
+    else:
+        logger.error("Failed to start the local API server after multiple attempts.")
+
+    process.terminate()  # Terminate the Flask server process to finish execution
+    return process
 
 
 class Package:
@@ -290,7 +363,7 @@ class Rebuilder:
         self.dsc_url = dsc_url
         self.orig_tar_url = orig_tar_url
         self.debian_tar_url = debian_tar_url
-
+        self.not_found_packages = []
         logger.debug(f"Input buildinfo: {buildinfo_file}")
 
         if buildinfo_file.startswith("http://") or buildinfo_file.startswith("https://"):
@@ -753,6 +826,17 @@ def pre_checks_for_keyrings():
 
 def initialize_and_find_dependencies(rebuilder):
     logger.debug("Initializing and finding build dependencies...")
+    # Before starting local checks, query each package in buildinfo
+    build_dependencies = rebuilder.buildinfo.get_build_depends()
+    all_found = True
+    for pkg in build_dependencies:
+        if not query_remote_package_repository(rebuilder, pkg):
+            all_found = False
+            rebuilder.not_found_packages.append(pkg)  # Append the not found package to the list
+
+    if not all_found:
+        logger.info("Not all dependencies found in the remote repository, proceeding with local resolution.")
+
     if rebuilder.use_metasnap:
         logger.debug("Using metasnap for getting required timestamps.")
         find_build_dependencies_from_metasnap(rebuilder)
@@ -760,6 +844,21 @@ def initialize_and_find_dependencies(rebuilder):
         logger.debug("Using standard snapshot method for getting required timestamps.")
         find_build_dependencies(rebuilder)
 
+def query_remote_package_repository(rebuilder, pkg):
+    """Query the remote package repository to check if a package exists with the specified version."""
+    logger.debug(f"Querying remote repository for package {pkg.name} version {pkg.version}")
+    query_url = f"http://remote-repo-url/packages/{pkg.name}/{pkg.version}"  # Adjust the URL as needed
+    try:
+        response = requests.get(query_url)
+        if response.status_code == 200:
+            logger.debug(f"Package {pkg.name}-{pkg.version} found in remote repository.")
+            return True
+        else:
+            logger.info(f"Package {pkg.name}-{pkg.version} not found in remote repository.")
+            return False
+    except requests.RequestException as e:
+        logger.error(f"Failed to query remote repository: {e}")
+        return False
 
 def cleanup_and_create_checkpoint(rebuilder):
     logger.debug("Cleaning up temporary directories...")
@@ -874,6 +973,69 @@ def find_build_dependencies(rebuilder):
         for notfound_pkg in notfound_packages:
             logger.debug(f"{notfound_pkg.name}-{notfound_pkg.version}.{notfound_pkg.architecture}")
         raise RebuilderException("Cannot locate the following packages via snapshots or the current repo/mirror")
+
+    download_missing_packages(rebuilder)  # Call the new function
+
+def download_missing_packages(rebuilder):
+    if not rebuilder.not_found_packages:
+        logger.debug("No missing packages to download.")
+        return
+
+    logger.debug(f"Attempting to download missing packages: {rebuilder.not_found_packages}")
+    for pkg in rebuilder.not_found_packages:
+        download_and_add_package(rebuilder, pkg)
+
+def download_and_add_package(rebuilder, pkg):
+    # Ensure the APT cache is initialized
+    rebuilder.tempaptcache.open()
+
+    try:
+        # Construct package identifier and attempt to fetch the package from the cache
+        package_key = f"{pkg.name}:{pkg.architecture if pkg.architecture else 'all'}"
+        package = rebuilder.tempaptcache.get(package_key)
+
+        if not package or not package.versions.get(pkg.version):
+            raise Exception(f"No available package found for {pkg.name} with version {pkg.version} and architecture {pkg.architecture}")
+
+        # Fetch the candidate version of the package
+        package_version = package.versions.get(pkg.version)
+        if package_version:
+            local_download_dir = "/app/pkg_dwnld"
+            os.makedirs(local_download_dir, exist_ok=True)
+            package_version.fetch_binary(destdir=local_download_dir)
+
+            # Path to the downloaded .deb file
+            package_filename = f"{pkg.name}_{pkg.version}_{pkg.architecture if pkg.architecture else 'all'}.deb"
+            package_path = os.path.join(local_download_dir, package_filename)
+
+            if os.path.exists(package_path):
+                logger.debug(f"Successfully downloaded {package_filename}")
+                with open(package_path, 'rb') as file:
+                    package_content = file.read()
+
+                # Check server health and attempt to add the package to the local repo
+                if not package_repo_api.check_server_health():
+                    raise Exception("Server is down!")
+
+                if add_package_to_local_repo(pkg.name, pkg.version, package_content):
+                    logger.debug(f"Package {pkg.name}-{pkg.version} successfully added to local repo.")
+                else:
+                    raise Exception(f"Failed to add package {pkg.name}-{pkg.version} to local repo.")
+                os.remove(package_path)
+            else:
+                raise FileNotFoundError(f"Expected downloaded package not found at {package_path}")
+        else:
+            raise Exception(f"No candidate version available for package {pkg.name}-{pkg.version}-{pkg.architecture}")
+    except KeyError:
+        error_details = f"No package found with name {pkg.name} and version {pkg.version}"
+        logger.error(error_details)
+        raise FileNotFoundError(error_details)
+    except Exception as e:
+        logger.error(f"Error during package fetch: {str(e)}")
+        raise
+    finally:
+        # Always close the cache to free resources
+        rebuilder.tempaptcache.close()
 
 
 def prepare_aptcache(rebuilder):
@@ -1256,7 +1418,7 @@ def get_sources_list_from_timestamp(self):
 
 if __name__ == "__main__":
     builder_json_file = sys.argv[1]
-
+    start_api_server()
     # Load the builder arguments from the JSON file
     with open(builder_json_file, 'r') as f:
         builder_args = json.load(f)
@@ -1282,5 +1444,4 @@ if __name__ == "__main__":
         orig_tar_url=builder_args["orig_tar_url"],
         debian_tar_url=builder_args["debian_tar_url"]
     )
-
     bootstrap_build_base_system(rebuilder)
