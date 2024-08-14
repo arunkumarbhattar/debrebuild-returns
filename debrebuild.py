@@ -532,10 +532,7 @@ def run(builder_args):
         run_in_docker(venv_command)
 
         create_persistent_json_file(builder_args)
-
-        test_command = "python3 test_httpx_import.py"
-        run_in_docker(test_command)
-
+        
         json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
         try:
             run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}", output_dir)
