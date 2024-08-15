@@ -111,11 +111,10 @@ class RebuilderChecksumsError(Exception):
 
 
 DEFAULT_DOCKERFILE_CONTENT = """
-FROM debian:stable-slim
+FROM debian:stable
 
 # Install necessary system packages
-RUN apt-get update && \
-    apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     bash \
     sudo \
     debootstrap \
@@ -133,7 +132,8 @@ RUN apt-get update && \
     libxslt1-dev \
     zlib1g-dev \
     mmdebstrap \
-    zsh
+    zsh \
+    && rm -rf /var/lib/apt/lists/*
 
 # Set up sudo privileges
 RUN echo 'ALL ALL=(ALL) NOPASSWD: ALL' >> /etc/sudoers
@@ -290,7 +290,7 @@ def run_python_in_docker(command, artifacts_dir):
         '-v', volume_mounts[2],  # Mount the package repository directory
         '-w', '/app',  # Set working directory to /app inside the container
         '--entrypoint', '/bin/bash', 'debrebuild',  # Using bash and debrebuild as the image name
-        '-c', f"python3 {command}"  # Run the specified Python command
+        '-c', f"source /app/venv/bin/activate && python3 {command}"  # Activate venv and run the specified Python command
     ]
 
     # Execute the Docker command
@@ -539,16 +539,18 @@ def run(builder_args):
 
         # Construct the command to create a virtual environment and install the packages
         venv_command = (
+            "mkdir -p /app && "  # Ensure /app directory exists
             "apt-get update && apt-get install -y python3-pip python3-venv && "
+            "rm -rf /app/venv && "  # Ensure any previous virtual environment is removed
             "python3 -m venv /app/venv && "
-            f"/app/venv/bin/pip install {' '.join(packages)}"
+            "/app/venv/bin/pip install " + " ".join(packages)
         )
 
         # Run the virtual environment creation and package installation command in the Docker container
         run_in_docker(venv_command)
 
         create_persistent_json_file(builder_args)
-        
+
         json_file_path = os.path.join(os.getcwd(), "persistent_args.json")
         try:
             run_python_in_docker(f"initialize_and_find_dependencies.py /app/{os.path.basename(json_file_path)}", output_dir)
@@ -771,11 +773,34 @@ def main():
         # Run the Python scripts inside the Docker container
         run(rebuilder_args)
     except RebuilderChecksumsError:
-        return 2
+        # Handle specific exception
+        try:
+            subprocess.run("docker stop $(docker ps -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+            subprocess.run("docker rm $(docker ps -a -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+        except subprocess.CalledProcessError as cleanup_error:
+            logger.error(f"Failed to cleanup Docker containers: {cleanup_error}")
+        sys.exit(2)
     except RebuilderException as e:
         logger.error(str(e))
-        return 1
-
+        # Handle specific exception
+        try:
+            subprocess.run("docker stop $(docker ps -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+            subprocess.run("docker rm $(docker ps -a -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+        except subprocess.CalledProcessError as cleanup_error:
+            logger.error(f"Failed to cleanup Docker containers: {cleanup_error}")
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        logger.error("Error running command in Docker: %s", e)
+        try:
+            subprocess.run("docker stop $(docker ps -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+            subprocess.run("docker rm $(docker ps -a -q --filter 'ancestor=debrebuild')", shell=True, check=True)
+        except subprocess.CalledProcessError as cleanup_error:
+            logger.error(f"Failed to cleanup Docker containers: {cleanup_error}")
+        sys.exit(1)
+    finally:
+        # Ensure all debrebuild containers are removed in case of any other issues
+        subprocess.run("docker ps -q --filter 'ancestor=debrebuild' | xargs -r docker stop", shell=True)
+        subprocess.run("docker ps -a -q --filter 'ancestor=debrebuild' | xargs -r docker rm", shell=True)
 
 if __name__ == "__main__":
     sys.exit(main())

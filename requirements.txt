@@ -1,7 +1,11 @@
 python-apt
 python-debian >= 0.1.40
-python-dateutil
-requests
-rstr
-httpx
-tenacity
+python-dateutil~=2.9.0.post0
+requests~=2.32.3
+rstr~=3.2.2
+httpx~=0.27.0
+tenacity~=9.0.0
+
+urllib3~=2.2.2
+beautifulsoup4~=4.12.3
+Flask~=3.0.3

@@ -12,9 +12,6 @@ import time
 import apt
 import debian.debian_support
 
-import requests
-import apt_pkg
-
 from bs4 import BeautifulSoup
 import debian.deb822
 from dateutil.parser import parse as parsedate
@@ -798,14 +795,8 @@ def bootstrap_build_base_system(rebuilder):
     pre_checks_for_keyrings()
 
     # Step 3: Initialize and find build dependencies
-    try:
-        initialize_and_find_dependencies(rebuilder)
-    except (apt_pkg.Error, apt.cache.FetchFailedException, requests.exceptions.ConnectionError) as e:
-        logger.error(f"Failed to fetch packages: {str(e)}")
-        raise RebuilderException(f"Failed to fetch packages: {str(e)}")
-    except KeyboardInterrupt:
-        logger.error("Operation interrupted by user.")
-        raise RebuilderException("Interruption")
+
+    initialize_and_find_dependencies(rebuilder)
 
     # Step 4: Clean up and create a checkpoint of the build state
     cleanup_and_create_checkpoint(rebuilder)
@@ -1098,16 +1089,11 @@ def prepare_aptcache(rebuilder):
         os.symlink(keyring_src, keyring_dst)
         logger.debug(f"Linked keyring: {keyring_src} to {keyring_dst}")
 
-    try:
-        logger.debug("Initializing APT cache")
-        # Initialze an APT cache object pointed at the temporary directory which allows manipulation
-        # of package states (like installation and removal) from the host's package system
-        rebuilder.tempaptcache = apt.Cache(rootdir=rebuilder.tempaptdir, memonly=True)
-        rebuilder.tempaptcache.close()
-    except (PermissionError, apt_pkg.Error) as e:
-        logger.error(f"Error initializing APT cache: {e}")
-        raise RebuilderException("Failed to initialize APT cache")
-
+    logger.debug("Initializing APT cache")
+    # Initialze an APT cache object pointed at the temporary directory which allows manipulation
+    # of package states (like installation and removal) from the host's package system
+    rebuilder.tempaptcache = apt.Cache(rootdir=rebuilder.tempaptdir, memonly=True)
+    rebuilder.tempaptcache.close()
 
 def find_build_dependencies_from_metasnap(rebuilder):
     status = False
